@@ -1,0 +1,61 @@
+{
+  "pipeline_config": {
+    "cities": ["Montreal"],
+    "poi_categories": [
+      "restaurant",
+      "cafe", 
+      "bar",
+      "tourist_attraction",
+      "shopping_mall",
+      "store",
+      "entertainment",
+      "park",
+      "gym",
+      "spa"
+    ],
+    "daily_api_limit": 95,
+    "batch_size": 20,
+    "max_pois_per_category": 100,
+    "update_interval_days": 7,
+    "social_proof_enabled": true,
+    "collections_enabled": true,
+    "photos_enabled": true,
+    "photo_batch_limit": 20,
+    "incremental_mode": true
+  },
+  
+  "ingestion_config": {
+    "comprehensive_search": true,
+    "max_queries_per_category": 10,
+    "rate_limit_delay": 1,
+    "neighborhood_specific_search": true,
+    "enhanced_details": true
+  },
+  
+  "social_proof_config": {
+    "max_queries_per_poi": 3,
+    "cache_enabled": true,
+    "cache_ttl_hours": 48,
+    "authority_threshold": 0.3,
+    "min_proof_sources": 1
+  },
+  
+  "classification_config": {
+    "contextual_tags_enabled": true,
+    "min_tag_confidence": 0.4,
+    "temporal_analysis": true,
+    "mood_mapping": {
+      "chill": ["cozy", "quiet", "relaxed", "intimate", "peaceful"],
+      "trendy": ["hip", "popular", "buzzing", "vibrant", "hotspot"],
+      "hidden_gem": ["hidden", "gem", "secret", "local", "authentic"]
+    }
+  },
+  
+  "deployment_config": {
+    "environment": "production",
+    "log_level": "INFO",
+    "backup_enabled": true,
+    "monitoring_enabled": true,
+    "error_notifications": false
+  }
+}

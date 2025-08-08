@@ -1,0 +1,162 @@
+# Trendr Data Pipeline - Git Ignore
+
+# Environment variables and secrets
+.env
+.env.local
+.env.production
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+trendr_env/
+
+# IDE and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Logs and databases
+*.log
+*.sqlite
+*.db
+data_pipeline.log
+pipeline_*.log
+
+# Cache directories
+cache/
+__pycache__/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Photo storage (exclude actual photos but keep structure)
+photos/*
+!photos/README.md
+!photos/sample/
+photos/sample/*
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Local configuration files
+config.local.json
+alerts_config.local.json
+
+# Test outputs
+test_results/
+test_*.json
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# PyCharm
+.idea/
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Node.js (if any frontend tools)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Docker
+.dockerignore
+Dockerfile.local
+
+# Deployment artifacts
+deploy_*.log
+deployment/
+
+# SSL certificates
+*.crt
+*.cert
+*.ca-bundle
+
+# API response cache files (but keep cache structure)
+cache/*
+!cache/.gitkeep
+
+# Large data files
+*.csv
+*.json.gz
+*.pickle
+*.pkl
+
+# Monitoring data
+monitoring/*.log
+monitoring/data/
+
+# Local scripts (not for production)
+scripts/local_*
+scripts/dev_*
+scripts/test_local*
+
+# Documentation builds
+docs/_build/
+site/
+
+# Coverage reports
+.coverage.*
+coverage.xml
+*.cover
+.hypothesis/
+
+# Profiling data
+.prof
+
+# Local development
+local/
+dev/

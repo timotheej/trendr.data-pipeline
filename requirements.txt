@@ -1,0 +1,58 @@
+# Trendr Data Pipeline - Production Dependencies
+# Core dependencies for data pipeline automation
+
+# Database & Storage
+supabase>=2.0.0
+python-dotenv>=1.0.0
+
+# HTTP & Web APIs  
+requests>=2.31.0
+urllib3>=2.0.0
+
+# Data Processing & Analysis
+python-dateutil>=2.8.0
+
+# Error Handling & Retries
+tenacity>=8.2.0
+
+# AI & LLM APIs (optional)
+openai>=1.3.0
+anthropic>=0.3.0
+
+# Google APIs - Essential for POI ingestion
+googlemaps>=4.10.0
+
+# Text Processing & NLP
+nltk>=3.8
+textblob>=0.17.0
+
+# Caching & Performance (for API caching system)
+diskcache>=5.6.0
+
+# Utilities & Data Structures
+pyyaml>=6.0
+pytz>=2023.3
+
+# Development & Testing
+pytest>=7.4.0
+
+# Progress Bars & CLI
+tqdm>=4.66.0
+click>=8.1.0
+
+# Geospatial Processing
+geopy>=2.3.0
+
+# JSON Processing
+orjson>=3.9.0
+
+# Rate Limiting
+ratelimit>=2.2.0
+
+# Image Processing (for POI photos) - REQUIRED
+Pillow>=10.0.0
+numpy>=1.24.0
+
+# Monitoring & Dashboard (Optional)
+flask>=2.3.0
+requests>=2.31.0

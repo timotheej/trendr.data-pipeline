@@ -1,0 +1,29 @@
+{
+  "email": {
+    "enabled": false,
+    "smtp_server": "smtp.gmail.com",
+    "smtp_port": 587,
+    "username": "your-email@gmail.com",
+    "password": "your-app-password",
+    "to_emails": ["admin@trendr.com"]
+  },
+  "discord": {
+    "enabled": false,
+    "webhook_url": "https://discord.com/api/webhooks/YOUR_WEBHOOK_URL"
+  },
+  "slack": {
+    "enabled": false,
+    "webhook_url": "https://hooks.slack.com/services/YOUR_SLACK_WEBHOOK"
+  },
+  "thresholds": {
+    "max_errors_per_hour": 10,
+    "max_api_quota_usage": 90,
+    "min_pois_ingested_daily": 5,
+    "max_execution_time_minutes": 30
+  },
+  "monitoring": {
+    "check_interval_minutes": 5,
+    "health_check_enabled": true,
+    "performance_monitoring": true
+  }
+}
