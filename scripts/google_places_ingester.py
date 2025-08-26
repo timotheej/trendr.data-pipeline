@@ -126,12 +126,17 @@ class GooglePlacesIngester:
             types = place_data.get('types', [])
             primary_category = self.determine_primary_category(types)
             
+            # Extract country from formatted address
+            formatted_address = place_data.get('formatted_address', '')
+            country = self.extract_country_from_address(formatted_address)
+            
             # Build POI data
             poi_data = {
                 'google_place_id': place_id,
                 'name': name,
-                'address': place_data.get('formatted_address', ''),
+                'address': formatted_address,
                 'city': city,
+                'country': country,
                 'category': primary_category,
                 'latitude': float(lat),
                 'longitude': float(lng),
@@ -198,6 +203,43 @@ class GooglePlacesIngester:
         
         # Default fallback
         return 'establishment'
+    
+    def extract_country_from_address(self, formatted_address: str) -> str:
+        """Extract country from Google Places formatted address."""
+        if not formatted_address:
+            return 'Canada'  # Default fallback
+            
+        # Split address by commas and get the last component (usually country)
+        address_parts = [part.strip() for part in formatted_address.split(',')]
+        
+        if len(address_parts) >= 2:
+            potential_country = address_parts[-1]
+            
+            # Known country mappings
+            country_mappings = {
+                'Canada': 'Canada',
+                'CA': 'Canada',
+                'United States': 'United States',
+                'USA': 'United States',
+                'US': 'United States',
+                'France': 'France',
+                'FR': 'France',
+                'United Kingdom': 'United Kingdom',
+                'UK': 'United Kingdom',
+                'GB': 'United Kingdom'
+            }
+            
+            # Check if we can map the potential country
+            for key, country in country_mappings.items():
+                if key.lower() == potential_country.lower():
+                    return country
+                    
+            # If no mapping found but it looks like a country (2-3 letters or proper name)
+            if len(potential_country) <= 3 or potential_country.istitle():
+                return potential_country
+        
+        # Default fallback
+        return 'Canada'
     
     def ingest_poi_to_db(self, poi_data: Dict[str, Any]) -> Optional[str]:
         """Ingest POI data to database with location enhancement."""

@@ -13,7 +13,8 @@ ADD COLUMN IF NOT EXISTS business_status VARCHAR(50),
 ADD COLUMN IF NOT EXISTS opening_hours JSONB,
 ADD COLUMN IF NOT EXISTS is_open_now BOOLEAN,
 ADD COLUMN IF NOT EXISTS photo_references JSONB,
-ADD COLUMN IF NOT EXISTS google_types JSONB;
+ADD COLUMN IF NOT EXISTS google_types JSONB,
+ADD COLUMN IF NOT EXISTS phone VARCHAR(50);
 
 -- Add unique constraint on google_place_id
 ALTER TABLE poi 
@@ -24,6 +25,7 @@ CREATE INDEX IF NOT EXISTS poi_google_place_id_idx ON poi (google_place_id);
 CREATE INDEX IF NOT EXISTS poi_primary_photo_idx ON poi (primary_photo);
 CREATE INDEX IF NOT EXISTS poi_photos_updated_at_idx ON poi (photos_updated_at);
 CREATE INDEX IF NOT EXISTS poi_last_google_sync_idx ON poi (last_google_sync);
+CREATE INDEX IF NOT EXISTS poi_phone_idx ON poi (phone);
 
 -- Update collections table for cover photos
 ALTER TABLE collections 
@@ -42,4 +44,5 @@ COMMENT ON COLUMN poi.primary_photo_quality IS 'Quality score (0-1) of the prima
 COMMENT ON COLUMN poi.all_photos IS 'JSON array of all photos with metadata';
 COMMENT ON COLUMN poi.photos_updated_at IS 'Timestamp when photos were last processed';
 COMMENT ON COLUMN poi.last_google_sync IS 'Last sync with Google Places API';
+COMMENT ON COLUMN poi.phone IS 'Phone number from Google Places API';
 COMMENT ON COLUMN collections.cover_photo IS 'File path to cover photo for this collection';
