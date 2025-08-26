@@ -72,14 +72,7 @@ class SupabaseManager:
     def insert_poi(self, poi_data: Dict[str, Any]) -> Optional[str]:
         """Insert a POI record and return the ID. Now supports neighborhood_id."""
         try:
-            # If neighborhood name is provided but no neighborhood_id, try to resolve it
-            if 'neighborhood' in poi_data and 'neighborhood_id' not in poi_data:
-                neighborhood = self.get_neighborhood_by_name(
-                    poi_data['neighborhood'], 
-                    poi_data.get('city', 'Montreal')
-                )
-                if neighborhood:
-                    poi_data['neighborhood_id'] = neighborhood['id']
+            # Neighborhood is stored as simple string field (simplified approach)
             
             result = self.client.table('poi').upsert(
                 poi_data,
@@ -95,10 +88,10 @@ class SupabaseManager:
             raise
 
     def get_pois_for_city(self, city: str, limit: int = 100) -> List[Dict[str, Any]]:
-        """Get POIs for a city with neighborhood information."""
+        """Get POIs for a city."""
         try:
             result = self.client.table('poi')\
-                .select('*, neighborhoods!poi_neighborhood_id_fkey(name, description)')\
+                .select('*')\
                 .eq('city', city)\
                 .limit(limit)\
                 .execute()
@@ -122,18 +115,25 @@ class SupabaseManager:
             logger.error(f"Error getting POIs by name {poi_name}: {e}")
             return []
 
+    # DEPRECATED: Using string neighborhoods instead
     def get_pois_for_neighborhood(self, neighborhood_id: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """Get POIs for a specific neighborhood."""
+        """DEPRECATED: Get POIs for a specific neighborhood.""" 
+        logger.warning("get_pois_for_neighborhood is deprecated - use string neighborhood filtering")
+        return []
+    
+    def get_pois_by_neighborhood_name(self, neighborhood_name: str, city: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Get POIs for a specific neighborhood by name."""
         try:
             result = self.client.table('poi')\
                 .select('*')\
-                .eq('neighborhood_id', neighborhood_id)\
+                .eq('neighborhood', neighborhood_name)\
+                .eq('city', city)\
                 .limit(limit)\
                 .execute()
             
             return result.data or []
         except Exception as e:
-            logger.error(f"Error getting POIs for neighborhood {neighborhood_id}: {e}")
+            logger.error(f"Error getting POIs for neighborhood {neighborhood_name}: {e}")
             return []
     
     def get_pois_within_radius(self, lat: float, lng: float, radius_km: float = 5.0, limit: int = 20) -> List[Dict[str, Any]]:
@@ -173,7 +173,7 @@ class SupabaseManager:
         """Get collections for a city, optionally filtered by type."""
         try:
             query = self.client.table('collections')\
-                .select('*, neighborhoods!collections_neighborhood_id_fkey(name)')\
+                .select('*')\
                 .eq('city', city)\
                 .order('updated_at', desc=True)
             
@@ -441,7 +441,7 @@ class SupabaseManager:
             result = self.client.table('poi')\
                 .select('id, name, latitude, longitude, city')\
                 .eq('city', city)\
-                .is_('neighborhood_id', 'null')\
+                .is_('neighborhood', 'null')\
                 .not_.is_('latitude', 'null')\
                 .not_.is_('longitude', 'null')\
                 .execute()

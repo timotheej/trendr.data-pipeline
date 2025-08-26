@@ -52,7 +52,7 @@ class GooglePlacesIngester:
         if not self.api_key:
             logger.warning("Google Places API key not configured")
     
-    def search_places(self, query: str, location: str = "Montreal, Canada") -> List[Dict[str, Any]]:
+    def search_places(self, query: str, location: str) -> List[Dict[str, Any]]:
         """Search for places using Google Places Text Search."""
         if not self.api_key:
             return []
@@ -102,7 +102,7 @@ class GooglePlacesIngester:
             logger.error(f"Failed to get details for place {place_id}: {e}")
             return None
     
-    def convert_place_data(self, place_data: Dict[str, Any], city: str = "Montreal") -> Optional[Dict[str, Any]]:
+    def convert_place_data(self, place_data: Dict[str, Any], city: str) -> Optional[Dict[str, Any]]:
         """Convert Google Places data to our POI format."""
         try:
             place_id = place_data.get('place_id')
@@ -207,7 +207,7 @@ class GooglePlacesIngester:
     def extract_country_from_address(self, formatted_address: str) -> str:
         """Extract country from Google Places formatted address."""
         if not formatted_address:
-            return 'Canada'  # Default fallback
+            return 'Unknown'  # Fallback when country cannot be determined
             
         # Split address by commas and get the last component (usually country)
         address_parts = [part.strip() for part in formatted_address.split(',')]
@@ -239,7 +239,7 @@ class GooglePlacesIngester:
                 return potential_country
         
         # Default fallback
-        return 'Canada'
+        return 'Unknown'
     
     def ingest_poi_to_db(self, poi_data: Dict[str, Any]) -> Optional[str]:
         """Ingest POI data to database with location enhancement."""
@@ -276,7 +276,7 @@ class GooglePlacesIngester:
             logger.error(f"Error ingesting POI: {e}")
             return None
     
-    def search_and_ingest_comprehensive(self, category: str, city: str = "Montreal", max_results: int = 100) -> List[str]:
+    def search_and_ingest_comprehensive(self, category: str, city: str, country: str, max_results: int = 100) -> List[str]:
         """Comprehensive search and ingestion for a category with multiple queries."""
         logger.info(f"🔍 COMPREHENSIVE ingestion: {category} in {city} (max: {max_results})")
         
@@ -298,12 +298,6 @@ class GooglePlacesIngester:
                 f"popular {google_type}"
             ])
         
-        # Add neighborhood-specific searches for Montreal
-        if city.lower() == 'montreal':
-            neighborhoods = ["Plateau Mont-Royal", "Old Montreal", "Downtown", "Mile End", "Outremont"]
-            for neighborhood in neighborhoods[:3]:  # Limit to avoid too many queries
-                search_queries.append(f"{category} {neighborhood}")
-        
         # Limit queries to avoid hitting API limits
         search_queries = search_queries[:10]
         
@@ -317,7 +311,7 @@ class GooglePlacesIngester:
             try:
                 logger.info(f"🔍 Query {i}/{len(search_queries)}: {query}")
                 
-                places = self.search_places(query, f"{city}, Canada")
+                places = self.search_places(query, f"{city}, {country}")
                 
                 for place in places:
                     place_id = place.get('place_id')
@@ -348,12 +342,12 @@ class GooglePlacesIngester:
         logger.info(f"✅ COMPREHENSIVE ingestion completed: {len(all_ingested_ids)} POIs for {category}")
         return all_ingested_ids
     
-    def search_and_ingest(self, query: str, city: str = "Montreal") -> List[str]:
+    def search_and_ingest(self, query: str, city: str, country: str) -> List[str]:
         """Basic search and ingest method for backward compatibility."""
         logger.info(f"Searching and ingesting: {query} in {city}")
         
         # Search for places
-        places = self.search_places(query, f"{city}, Canada")
+        places = self.search_places(query, f"{city}, {country}")
         ingested_ids = []
         
         for place in places:
@@ -382,7 +376,7 @@ class GooglePlacesIngester:
         logger.info(f"Ingested {len(ingested_ids)} POIs for '{query}'")
         return ingested_ids
     
-    def run_full_city_ingestion(self, city: str = "Montreal", categories: List[str] = None) -> Dict[str, int]:
+    def run_full_city_ingestion(self, city: str, country: str, categories: List[str] = None) -> Dict[str, int]:
         """Run full city ingestion across all categories."""
         if categories is None:
             categories = list(self.category_mapping.keys())
@@ -399,7 +393,7 @@ class GooglePlacesIngester:
                 
                 # Comprehensive ingestion for this category
                 ingested_ids = self.search_and_ingest_comprehensive(
-                    category, city, max_results=50  # Limit per category
+                    category, city, country, max_results=50  # Limit per category
                 )
                 
                 results[category] = len(ingested_ids)

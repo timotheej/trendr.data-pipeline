@@ -68,7 +68,7 @@ class TrendrDataPipeline:
     def load_config(self, config_file: str = None) -> Dict[str, Any]:
         """Load pipeline configuration"""
         default_config = {
-            'cities': ['Montreal'],
+            'cities': [],  # Will be populated from CLI argument
             'poi_categories': [
                 'restaurant', 'cafe', 'bar', 'night_club', 
                 'shopping_mall', 'store', 'tourist_attraction',
@@ -113,10 +113,11 @@ class TrendrDataPipeline:
             logger.error(f"❌ Missing environment variables: {missing_vars}")
             return False
         
-        # Check database connection
+        # Check database connection (test with any city that has data)
         try:
-            neighborhoods = self.db.get_neighborhoods_for_city('Montreal')
-            logger.info(f"✅ DB Connection: {len(neighborhoods)} neighborhoods found")
+            # Test basic table access without hardcoding city
+            result = self.db.client.table('poi').select('id').limit(1).execute()
+            logger.info(f"✅ DB Connection: Database accessible")
         except Exception as e:
             logger.error(f"❌ DB connection error: {e}")
             return False
@@ -191,7 +192,7 @@ class TrendrDataPipeline:
                 
                 # Build search query
                 search_query = f"{category}"
-                location = f"{city}, Canada"
+                location = f"{city}, {self.config.get('country', 'Unknown')}"
                 
                 # Ingest POIs
                 ingested_ids = self.ingester.search_and_ingest(search_query, location)
@@ -223,7 +224,8 @@ class TrendrDataPipeline:
         cutoff_date = datetime.now() - timedelta(days=self.config.get('update_interval_days', 7))
         
         # For simplicity, take recently ingested POIs
-        recent_pois = self.db.get_pois_for_city('Montreal', limit=50)  # Adjust as needed
+        city = self.config.get('cities', [''])[0] if self.config.get('cities') else 'unknown'
+        recent_pois = self.db.get_pois_for_city(city, limit=50)
         unclassified_pois = [poi for poi in recent_pois if not poi.get('primary_mood')]
         
         logger.info(f"🎯 {len(unclassified_pois)} POIs to process for classification")
@@ -246,7 +248,7 @@ class TrendrDataPipeline:
                 # Collect social proofs
                 proofs = self.proof_scanner.enhanced_search_for_poi(
                     poi['name'],
-                    poi.get('city', 'Montreal'),
+                    poi.get('city', city),
                     poi.get('category', '')
                 )
                 
@@ -442,7 +444,7 @@ class TrendrDataPipeline:
             
             # Run photo backfill for POIs without photos
             result = self.photo_processor.run_photo_backfill(
-                city="Montreal",
+                city=city,
                 limit=photo_batch_limit,
                 rate_limit=1.5  # Slower rate to be conservative
             )
@@ -592,13 +594,16 @@ def main():
     parser.add_argument('--config', help='JSON configuration file')
     parser.add_argument('--mode', choices=['full', 'ingestion', 'classification', 'collections'], 
                        default='full', help='Execution mode')
-    parser.add_argument('--city', default='Montreal', help='City to process')
+    parser.add_argument('--city', required=True, help='City to process')
     parser.add_argument('--dry-run', action='store_true', help='Simulation without modifications')
     
     args = parser.parse_args()
     
     # Initialize pipeline
     pipeline = TrendrDataPipeline(config_file=args.config)
+    
+    # Add city to config
+    pipeline.config['cities'] = [args.city]
     
     # Execute according to mode
     if args.mode == 'full':

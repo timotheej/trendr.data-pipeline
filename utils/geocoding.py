@@ -181,34 +181,16 @@ class NeighborhoodAttributor:
             neighborhood_name, method = self.determine_neighborhood(lat, lng, city)
             
             if neighborhood_name:
-                # Get or create neighborhood in database
-                neighborhood = self.db.get_neighborhood_by_name(neighborhood_name, city)
+                # Update POI with neighborhood name directly (simplified approach)
+                result = self.db.client.table('poi')\
+                    .update({
+                        'neighborhood': neighborhood_name
+                    })\
+                    .eq('id', poi_id)\
+                    .execute()
                 
-                if not neighborhood:
-                    # Create new neighborhood entry
-                    neighborhood_data = {
-                        'name': neighborhood_name,
-                        'city': city,
-                        'description': f'Neighborhood in {city}',
-                        'keywords': [neighborhood_name.lower().replace(' ', '-')]
-                    }
-                    neighborhood_id = self.db.insert_neighborhood(neighborhood_data)
-                    logger.info(f"Created neighborhood: {neighborhood_name}")
-                else:
-                    neighborhood_id = neighborhood['id']
-                
-                # Update POI with neighborhood_id
-                if neighborhood_id:
-                    result = self.db.client.table('poi')\
-                        .update({
-                            'neighborhood_id': neighborhood_id,
-                            'neighborhood': neighborhood_name
-                        })\
-                        .eq('id', poi_id)\
-                        .execute()
-                    
-                    logger.info(f"✅ POI {poi_id} → {neighborhood_name} (via {method})")
-                    return True
+                logger.info(f"✅ POI {poi_id} → {neighborhood_name} (via {method})")
+                return True
             
             logger.warning(f"❌ Could not determine neighborhood for POI {poi_id}")
             return False

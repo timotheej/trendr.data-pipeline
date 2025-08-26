@@ -32,14 +32,14 @@ class DynamicNeighborhoodCalculator:
             'hidden_gem': 0.33
         }
     
-    def calculate_neighborhood_mood_distribution(self, neighborhood_id: str) -> Optional[Dict[str, float]]:
+    def calculate_neighborhood_mood_distribution(self, neighborhood_name: str, city: str) -> Optional[Dict[str, float]]:
         """Calculate mood distribution for a neighborhood based on its POIs."""
         try:
-            # Get all POIs in the neighborhood
-            pois = self.db.get_pois_for_neighborhood(neighborhood_id)
+            # Get all POIs in the neighborhood by name
+            pois = self.db.get_pois_by_neighborhood_name(neighborhood_name, city)
             
             if not pois:
-                logger.warning(f"No POIs found for neighborhood {neighborhood_id}")
+                logger.warning(f"No POIs found for neighborhood {neighborhood_name}")
                 return self.default_distribution
             
             # Count mood tags (use both current mood_tag and intelligent classifications)
