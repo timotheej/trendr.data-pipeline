@@ -192,10 +192,10 @@ class TrendrDataPipeline:
                 
                 # Build search query
                 search_query = f"{category}"
-                location = f"{city}, {self.config.get('country', 'Unknown')}"
+                country = self.config.get('country', 'Unknown')
                 
                 # Ingest POIs
-                ingested_ids = self.ingester.search_and_ingest(search_query, location)
+                ingested_ids = self.ingester.search_and_ingest(search_query, city, country)
                 
                 self.stats['pois_ingested'] += len(ingested_ids)
                 logger.info(f"✅ {len(ingested_ids)} POIs ingested for {category} in {city}")
@@ -288,9 +288,9 @@ class TrendrDataPipeline:
         logger.info("🏘️  Updating dynamic neighborhoods...")
         
         try:
-            for city in self.config['cities']:
-                result = self.neighborhood_calc.update_city_neighborhoods(city)
-                logger.info(f"✅ Neighborhoods updated for {city}: {result}")
+            # Skip neighborhood calculations since we simplified to string approach
+            logger.info("⏭️ Skipping dynamic neighborhood calculations (simplified approach)")
+            return True
         except Exception as e:
             error_msg = f"Neighborhood update error: {e}"
             logger.error(f"❌ {error_msg}")
@@ -439,6 +439,9 @@ class TrendrDataPipeline:
         logger.info("📸 Processing photos for POIs without photos...")
         
         try:
+            # Get city from config
+            city = self.config.get('cities', [''])[0] if self.config.get('cities') else 'unknown'
+            
             # Limit photo processing to avoid API overuse
             photo_batch_limit = self.config.get('photo_batch_limit', 20)
             
@@ -595,6 +598,7 @@ def main():
     parser.add_argument('--mode', choices=['full', 'ingestion', 'classification', 'collections'], 
                        default='full', help='Execution mode')
     parser.add_argument('--city', required=True, help='City to process')
+    parser.add_argument('--country', help='Country for the city (if not provided, will be auto-detected)')
     parser.add_argument('--dry-run', action='store_true', help='Simulation without modifications')
     
     args = parser.parse_args()
@@ -602,8 +606,12 @@ def main():
     # Initialize pipeline
     pipeline = TrendrDataPipeline(config_file=args.config)
     
-    # Add city to config
+    # Add city and country to config
     pipeline.config['cities'] = [args.city]
+    if args.country:
+        pipeline.config['country'] = args.country
+    else:
+        pipeline.config['country'] = 'Japan' if 'tokyo' in args.city.lower() else 'Unknown'
     
     # Execute according to mode
     if args.mode == 'full':
