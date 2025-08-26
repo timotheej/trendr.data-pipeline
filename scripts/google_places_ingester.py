@@ -126,9 +126,10 @@ class GooglePlacesIngester:
             types = place_data.get('types', [])
             primary_category = self.determine_primary_category(types)
             
-            # Extract country from formatted address
+            # Extract country and neighborhood from formatted address
             formatted_address = place_data.get('formatted_address', '')
             country = self.extract_country_from_address(formatted_address)
+            neighborhood = self.extract_neighborhood_from_address(formatted_address)
             
             # Build POI data
             poi_data = {
@@ -137,6 +138,7 @@ class GooglePlacesIngester:
                 'address': formatted_address,
                 'city': city,
                 'country': country,
+                'neighborhood': neighborhood,
                 'category': primary_category,
                 'latitude': float(lat),
                 'longitude': float(lng),
@@ -182,7 +184,7 @@ class GooglePlacesIngester:
             if category in google_types:
                 return category
         
-        # Fallback mappings
+        # Fallback mappings - all mapped to valid DB categories
         type_mappings = {
             'meal_takeaway': 'restaurant',
             'meal_delivery': 'restaurant', 
@@ -190,19 +192,21 @@ class GooglePlacesIngester:
             'electronics_store': 'store',
             'book_store': 'store',
             'art_gallery': 'tourist_attraction',
-            'movie_theater': 'entertainment',
+            'movie_theater': 'tourist_attraction',  # Changed to valid category
             'beauty_salon': 'spa',
-            'hospital': 'health',
-            'pharmacy': 'health',
-            'bank': 'service'
+            'hospital': 'tourist_attraction',      # Changed to valid category
+            'pharmacy': 'store',                   # Changed to valid category
+            'bank': 'store',                      # Changed to valid category
+            'establishment': 'tourist_attraction', # Handle the generic type
+            'point_of_interest': 'tourist_attraction'
         }
         
         for google_type in google_types:
             if google_type in type_mappings:
                 return type_mappings[google_type]
         
-        # Default fallback
-        return 'establishment'
+        # Default fallback - use a valid category
+        return 'tourist_attraction'  # Safe fallback that exists in DB constraint
     
     def extract_country_from_address(self, formatted_address: str) -> str:
         """Extract country from Google Places formatted address."""
@@ -241,11 +245,33 @@ class GooglePlacesIngester:
         # Default fallback
         return 'Unknown'
     
+    def extract_neighborhood_from_address(self, formatted_address: str) -> Optional[str]:
+        """Extract neighborhood from Google Places formatted address."""
+        if not formatted_address:
+            return None
+            
+        # Split address by commas
+        parts = [part.strip() for part in formatted_address.split(',')]
+        
+        # For most cities, neighborhood is usually the 2nd part (after street)
+        # Examples:
+        # "123 Main St, Montmartre, 75018 Paris, France" -> "Montmartre"  
+        # "456 Broadway, Greenwich Village, New York, NY, USA" -> "Greenwich Village"
+        
+        if len(parts) >= 3:
+            potential_neighborhood = parts[1]
+            
+            # Skip if it looks like a postal code or city
+            if not potential_neighborhood.replace(' ', '').isdigit() and len(potential_neighborhood) > 2:
+                return potential_neighborhood
+        
+        return None
+    
     def ingest_poi_to_db(self, poi_data: Dict[str, Any]) -> Optional[str]:
         """Ingest POI data to database with location enhancement."""
         try:
-            # Enhance with location data (neighborhood assignment)
-            enhanced_poi = enhance_poi_with_location_data(poi_data)
+            # POI data already has neighborhood from Google Places address
+            enhanced_poi = poi_data
             
             # Insert POI in database
             poi_id = self.db.insert_poi(enhanced_poi)

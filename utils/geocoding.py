@@ -56,9 +56,15 @@ class NeighborhoodAttributor:
         
         return R * c
     
-    def find_neighborhood_by_proximity(self, lat: float, lng: float, city: str = 'Montreal') -> Optional[str]:
+    def find_neighborhood_by_proximity(self, lat: float, lng: float, city: str = 'Unknown') -> Optional[str]:
         """Find neighborhood by proximity to known centers."""
-        if city.lower() == 'montreal':
+        city_lower = city.lower()
+        
+        # For cities we don't have proximity data, return None to use Google geocoding
+        if city_lower not in ['montreal', 'montréal']:
+            return None
+            
+        if city_lower in ['montreal', 'montréal']:
             closest_neighborhood = None
             min_distance = float('inf')
             
@@ -124,11 +130,11 @@ class NeighborhoodAttributor:
             elif 'locality' in types:
                 parsed['locality'] = name
         
-        # Best guess for neighborhood
+        # Best guess for neighborhood - avoid using city name
         parsed['best_neighborhood'] = (
             parsed['neighborhood'] or 
             parsed['sublocality'] or
-            parsed['locality']
+            None  # Don't use locality as it's often the city name
         )
         
         return parsed
@@ -245,7 +251,7 @@ def enhance_poi_with_location_data(poi_data: dict) -> dict:
             neighborhood_name, method = attributor.determine_neighborhood(
                 poi_data['latitude'], 
                 poi_data['longitude'],
-                poi_data.get('city', 'Montreal')
+                poi_data.get('city', 'Unknown')
             )
             if neighborhood_name:
                 poi_data['neighborhood'] = neighborhood_name
