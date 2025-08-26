@@ -242,6 +242,21 @@ except Exception as e:
     
     if [ $? -eq 0 ]; then
         print_status "✅ Installation validated"
+        
+        # Database schema check
+        echo ""
+        print_status "🔍 Checking database schema..."
+        python scripts/database_schema_updater.py --check
+        if [ $? -ne 0 ]; then
+            print_warning "⚠️ Database schema needs updating"
+            echo ""
+            echo "📋 Next steps after deployment:"
+            echo "1. Run: python scripts/database_schema_updater.py --update-guide"
+            echo "2. Apply the SQL schema update in Supabase"
+            echo "3. Test pipeline: python run_pipeline.py --dry-run"
+        else
+            print_status "✅ Database schema is up to date"
+        fi
     else
         print_error "❌ Validation problem"
         exit 1
