@@ -34,10 +34,10 @@ logger = logging.getLogger(__name__)
 class POIPhotoManager:
     """Manages POI photos with intelligent selection and optimization"""
     
-    def __init__(self, storage_path: str = "/var/trendr/photos"):
+    def __init__(self, storage_path: str = None):
         self.db = SupabaseManager()
         self.api_key = config.GOOGLE_PLACES_API_KEY
-        self.storage_path = Path(storage_path)
+        self.storage_path = Path(storage_path or config.PHOTOS_STORAGE_PATH)
         self.storage_path.mkdir(parents=True, exist_ok=True)
         
         # Photo quality scoring weights

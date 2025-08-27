@@ -126,6 +126,9 @@ class GooglePlacesIngester:
             types = place_data.get('types', [])
             primary_category = self.determine_primary_category(types)
             
+            # Debug log for category issues
+            logger.debug(f"POI: {name} | Google types: {types} | Assigned category: {primary_category}")
+            
             # Extract country and neighborhood from formatted address
             formatted_address = place_data.get('formatted_address', '')
             country = self.extract_country_from_address(formatted_address)
@@ -172,7 +175,7 @@ class GooglePlacesIngester:
     
     def determine_primary_category(self, google_types: List[str]) -> str:
         """Determine primary category from Google types."""
-        # Priority order for category determination
+        # Priority order for category determination - align with DB constraints
         priority_categories = [
             'restaurant', 'cafe', 'bar', 'night_club',
             'tourist_attraction', 'museum', 'shopping_mall',
@@ -184,21 +187,67 @@ class GooglePlacesIngester:
             if category in google_types:
                 return category
         
-        # Fallback mappings - all mapped to valid DB categories
+        # Comprehensive fallback mappings - all mapped to valid DB categories
         type_mappings = {
+            # Food & Drink
             'meal_takeaway': 'restaurant',
-            'meal_delivery': 'restaurant', 
+            'meal_delivery': 'restaurant',
+            'food': 'restaurant',
+            
+            # Shopping
             'clothing_store': 'store',
-            'electronics_store': 'store',
+            'electronics_store': 'store', 
             'book_store': 'store',
+            'jewelry_store': 'store',
+            'furniture_store': 'store',
+            'home_goods_store': 'store',
+            'shoe_store': 'store',
+            
+            # Attractions & Culture
             'art_gallery': 'tourist_attraction',
-            'movie_theater': 'tourist_attraction',  # Changed to valid category
+            'movie_theater': 'tourist_attraction',
+            'amusement_park': 'tourist_attraction',
+            'zoo': 'tourist_attraction',
+            'aquarium': 'tourist_attraction',
+            'church': 'tourist_attraction',
+            'hindu_temple': 'tourist_attraction',
+            'synagogue': 'tourist_attraction',
+            'mosque': 'tourist_attraction',
+            'place_of_worship': 'tourist_attraction',
+            'cemetery': 'tourist_attraction',
+            'library': 'tourist_attraction',
+            'university': 'tourist_attraction',
+            'school': 'tourist_attraction',
+            
+            # Services
             'beauty_salon': 'spa',
-            'hospital': 'tourist_attraction',      # Changed to valid category
-            'pharmacy': 'store',                   # Changed to valid category
-            'bank': 'store',                      # Changed to valid category
-            'establishment': 'tourist_attraction', # Handle the generic type
-            'point_of_interest': 'tourist_attraction'
+            'hair_care': 'spa',
+            'hospital': 'tourist_attraction', 
+            'pharmacy': 'store',
+            'bank': 'store',
+            'atm': 'store',
+            'gas_station': 'store',
+            'car_repair': 'store',
+            'dentist': 'tourist_attraction',
+            'doctor': 'tourist_attraction',
+            'veterinary_care': 'tourist_attraction',
+            
+            # Generic types
+            'establishment': 'tourist_attraction',
+            'point_of_interest': 'tourist_attraction',
+            'premise': 'tourist_attraction',
+            
+            # Transportation  
+            'airport': 'tourist_attraction',
+            'train_station': 'tourist_attraction',
+            'subway_station': 'tourist_attraction',
+            'bus_station': 'tourist_attraction',
+            
+            # Government & Finance
+            'city_hall': 'tourist_attraction',
+            'courthouse': 'tourist_attraction',
+            'embassy': 'tourist_attraction',
+            'post_office': 'store'
         }
         
         for google_type in google_types:

@@ -19,3 +19,6 @@ GOOGLE_CUSTOM_SEARCH_ENGINE_ID = os.getenv('GOOGLE_CUSTOM_SEARCH_ENGINE_ID')
 # AI APIs for Collection Generation (Optional)
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
+
+# Photo Storage Path (configurable)
+PHOTOS_STORAGE_PATH = os.getenv('PHOTOS_STORAGE_PATH', os.path.expanduser('~/trendr_photos'))
