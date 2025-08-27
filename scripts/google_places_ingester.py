@@ -32,22 +32,8 @@ class GooglePlacesIngester:
         self.api_key = config.GOOGLE_PLACES_API_KEY
         self.photo_manager = POIPhotoManager()
         
-        # Enhanced category mapping for comprehensive coverage
-        self.category_mapping = {
-            'restaurant': ['restaurant', 'meal_takeaway', 'meal_delivery'],
-            'cafe': ['cafe'],
-            'bar': ['bar', 'night_club'],
-            'shopping_mall': ['shopping_mall'],
-            'store': ['store', 'clothing_store', 'electronics_store', 'book_store'],
-            'tourist_attraction': ['tourist_attraction', 'museum', 'art_gallery'],
-            'entertainment': ['movie_theater', 'amusement_park', 'zoo'],
-            'health': ['hospital', 'pharmacy', 'doctor'],
-            'service': ['bank', 'post_office', 'gas_station'],
-            'lodging': ['lodging'],
-            'gym': ['gym'],
-            'spa': ['spa', 'beauty_salon'],
-            'park': ['park']
-        }
+        # Store Google types directly - more scalable approach
+        # Classification can be done later as a separate step
         
         if not self.api_key:
             logger.warning("Google Places API key not configured")
@@ -122,9 +108,9 @@ class GooglePlacesIngester:
                 logger.warning(f"Missing coordinates for {name}")
                 return None
             
-            # Determine primary category
+            # Use primary Google type directly - more flexible and scalable
             types = place_data.get('types', [])
-            primary_category = self.determine_primary_category(types)
+            primary_category = types[0] if types else 'establishment'
             
             # Debug log for category issues
             logger.debug(f"POI: {name} | Google types: {types} | Assigned category: {primary_category}")
@@ -173,89 +159,7 @@ class GooglePlacesIngester:
             logger.error(f"Error converting place data: {e}")
             return None
     
-    def determine_primary_category(self, google_types: List[str]) -> str:
-        """Determine primary category from Google types."""
-        # Priority order for category determination - align with DB constraints
-        priority_categories = [
-            'restaurant', 'cafe', 'bar', 'night_club',
-            'tourist_attraction', 'museum', 'shopping_mall',
-            'store', 'lodging', 'park', 'gym', 'spa'
-        ]
-        
-        # Find the highest priority category
-        for category in priority_categories:
-            if category in google_types:
-                return category
-        
-        # Comprehensive fallback mappings - all mapped to valid DB categories
-        type_mappings = {
-            # Food & Drink
-            'meal_takeaway': 'restaurant',
-            'meal_delivery': 'restaurant',
-            'food': 'restaurant',
-            
-            # Shopping
-            'clothing_store': 'store',
-            'electronics_store': 'store', 
-            'book_store': 'store',
-            'jewelry_store': 'store',
-            'furniture_store': 'store',
-            'home_goods_store': 'store',
-            'shoe_store': 'store',
-            
-            # Attractions & Culture
-            'art_gallery': 'tourist_attraction',
-            'movie_theater': 'tourist_attraction',
-            'amusement_park': 'tourist_attraction',
-            'zoo': 'tourist_attraction',
-            'aquarium': 'tourist_attraction',
-            'church': 'tourist_attraction',
-            'hindu_temple': 'tourist_attraction',
-            'synagogue': 'tourist_attraction',
-            'mosque': 'tourist_attraction',
-            'place_of_worship': 'tourist_attraction',
-            'cemetery': 'tourist_attraction',
-            'library': 'tourist_attraction',
-            'university': 'tourist_attraction',
-            'school': 'tourist_attraction',
-            
-            # Services
-            'beauty_salon': 'spa',
-            'hair_care': 'spa',
-            'hospital': 'tourist_attraction', 
-            'pharmacy': 'store',
-            'bank': 'store',
-            'atm': 'store',
-            'gas_station': 'store',
-            'car_repair': 'store',
-            'dentist': 'tourist_attraction',
-            'doctor': 'tourist_attraction',
-            'veterinary_care': 'tourist_attraction',
-            
-            # Generic types
-            'establishment': 'tourist_attraction',
-            'point_of_interest': 'tourist_attraction',
-            'premise': 'tourist_attraction',
-            
-            # Transportation  
-            'airport': 'tourist_attraction',
-            'train_station': 'tourist_attraction',
-            'subway_station': 'tourist_attraction',
-            'bus_station': 'tourist_attraction',
-            
-            # Government & Finance
-            'city_hall': 'tourist_attraction',
-            'courthouse': 'tourist_attraction',
-            'embassy': 'tourist_attraction',
-            'post_office': 'store'
-        }
-        
-        for google_type in google_types:
-            if google_type in type_mappings:
-                return type_mappings[google_type]
-        
-        # Default fallback - use a valid category
-        return 'tourist_attraction'  # Safe fallback that exists in DB constraint
+    # Removed complex category mapping - using Google types directly now
     
     def extract_country_from_address(self, formatted_address: str) -> str:
         """Extract country from Google Places formatted address."""
@@ -355,26 +259,17 @@ class GooglePlacesIngester:
         """Comprehensive search and ingestion for a category with multiple queries."""
         logger.info(f"🔍 COMPREHENSIVE ingestion: {category} in {city} (max: {max_results})")
         
-        # Get Google types for this category
-        google_types = self.category_mapping.get(category, [category])
-        
         all_ingested_ids = []
         seen_place_ids = set()
         
-        # Search variations for comprehensive coverage
-        search_queries = []
-        
-        # Basic category searches
-        for google_type in google_types:
-            search_queries.extend([
-                google_type,
-                f"best {google_type}",
-                f"top {google_type}",
-                f"popular {google_type}"
-            ])
-        
-        # Limit queries to avoid hitting API limits
-        search_queries = search_queries[:10]
+        # Simple search variations for comprehensive coverage
+        search_queries = [
+            category,
+            f"best {category}",
+            f"top {category}",
+            f"popular {category}",
+            f"{category} near me"
+        ]
         
         logger.info(f"📊 Will execute {len(search_queries)} search queries")
         
@@ -454,7 +349,11 @@ class GooglePlacesIngester:
     def run_full_city_ingestion(self, city: str, country: str, categories: List[str] = None) -> Dict[str, int]:
         """Run full city ingestion across all categories."""
         if categories is None:
-            categories = list(self.category_mapping.keys())
+            categories = [
+                'restaurant', 'cafe', 'bar', 'night_club', 
+                'shopping_mall', 'store', 'tourist_attraction',
+                'museum', 'park', 'gym', 'spa', 'hotel'
+            ]
         
         logger.info(f"🚀 FULL CITY INGESTION: {city}")
         logger.info(f"📋 Categories: {categories}")
