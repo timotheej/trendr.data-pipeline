@@ -306,10 +306,22 @@ class TrendrMonitoringSystem:
         logger.info(f"🚀 Initial system status: {initial_report['system_health']}")
         
         if daemon:
-            # Run in background thread
+            # Run in background thread but keep main process alive
             monitoring_thread = threading.Thread(target=self.run_monitoring_loop, daemon=True)
             monitoring_thread.start()
             logger.info("🔄 Monitoring started in daemon mode")
+            
+            # Keep main thread alive
+            try:
+                while self.is_running:
+                    time.sleep(30)  # Check every 30 seconds
+                    if not monitoring_thread.is_alive():
+                        logger.error("❌ Monitoring thread died, restarting...")
+                        monitoring_thread = threading.Thread(target=self.run_monitoring_loop, daemon=True)
+                        monitoring_thread.start()
+            except KeyboardInterrupt:
+                logger.info("🛑 Received interrupt signal")
+                self.stop_monitoring()
         else:
             # Run in foreground
             self.run_monitoring_loop()
