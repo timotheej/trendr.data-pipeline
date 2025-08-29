@@ -8,6 +8,7 @@ import os
 import logging
 import time
 import json
+import signal
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Any, Optional
 import schedule
@@ -331,9 +332,18 @@ class TrendrMonitoringSystem:
         logger.info("🛑 Stopping monitoring system...")
         self.is_running = False
 
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully."""
+    logger.info(f"🛑 Received signal {signum}, shutting down...")
+    sys.exit(0)
+
 def main():
     """Main entry point."""
     import argparse
+    
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
     
     parser = argparse.ArgumentParser(description='Trendr Monitoring System')
     parser.add_argument('--daemon', action='store_true', help='Run in daemon mode')
