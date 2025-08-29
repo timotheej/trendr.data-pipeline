@@ -70,21 +70,24 @@ class SupabaseManager:
     
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     def insert_poi(self, poi_data: Dict[str, Any]) -> Optional[str]:
-        """Insert a POI record and return the ID. Now supports neighborhood_id."""
+        """Insert a POI record and return the ID. Filters out deprecated fields."""
         try:
-            # Neighborhood is stored as simple string field (simplified approach)
+            # Remove deprecated fields to keep database clean
+            deprecated_fields = {'business_status', 'last_google_sync', 'last_updated', 'maps_url', 'website_url'}
+            clean_data = {k: v for k, v in poi_data.items() 
+                         if k not in deprecated_fields}
             
             result = self.client.table('poi').upsert(
-                poi_data,
+                clean_data,
                 on_conflict='name,address,city'
             ).execute()
             
             if result.data:
-                logger.info(f"Inserted/Updated POI: {poi_data['name']}")
+                logger.info(f"Inserted/Updated POI: {clean_data['name']}")
                 return result.data[0]['id']
             return None
         except Exception as e:
-            logger.error(f"Error inserting POI {poi_data['name']}: {e}")
+            logger.error(f"Error inserting POI {poi_data.get('name', 'Unknown')}: {e}")
             raise
 
     def get_pois_for_city(self, city: str, limit: int = 100) -> List[Dict[str, Any]]:

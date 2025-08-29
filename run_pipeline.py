@@ -9,7 +9,7 @@ import os
 import logging
 import time
 import argparse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Any, Optional
 import json
 
@@ -21,7 +21,7 @@ from utils.api_cache import google_search_cache
 from scripts.google_places_ingester import GooglePlacesIngester
 from scripts.enhanced_proof_scanner import EnhancedProofScanner
 from scripts.intelligent_classifier import IntelligentClassifier
-from scripts.dynamic_neighborhoods import DynamicNeighborhoodCalculator
+# from scripts.dynamic_neighborhoods import DynamicNeighborhoodCalculator  # Not essential
 from scripts.photo_processor import PhotoProcessor
 from ai.collection_generator import CollectionGenerator
 
@@ -47,7 +47,7 @@ class TrendrDataPipeline:
         self.ingester = GooglePlacesIngester()
         self.proof_scanner = EnhancedProofScanner()
         self.classifier = IntelligentClassifier()
-        self.neighborhood_calc = DynamicNeighborhoodCalculator()
+        # self.neighborhood_calc = DynamicNeighborhoodCalculator()  # Not essential
         self.photo_processor = PhotoProcessor()
         self.collection_gen = CollectionGenerator()
         
@@ -171,46 +171,39 @@ class TrendrDataPipeline:
         }
         return priority_map.get(category, 6)
     
-    def execute_ingestion_plan(self, plan: List[Dict[str, Any]]) -> bool:
-        """Execute ingestion plan while respecting quotas"""
-        logger.info("📍 Starting POI ingestion...")
+    def execute_neighborhood_rotation_ingestion(self, city: str) -> bool:
+        """Execute cost-efficient neighborhood rotation ingestion for new POI detection"""
+        logger.info(f"🎯 Starting neighborhood rotation ingestion for {city}")
         
-        total_api_calls = 0
-        
-        for task in plan:
-            # Check API limit
-            if total_api_calls >= self.config['daily_api_limit']:
-                logger.warning(f"🚫 API limit reached ({total_api_calls}), stopping ingestion")
-                break
+        try:
+            country = self.config.get('country', 'France')
             
-            try:
-                city = task['city']
-                category = task['category']
-                to_ingest = task['to_ingest']
-                
-                logger.info(f"🔄 Ingestion: {category} in {city} ({to_ingest} POIs)")
-                
-                # Build search query
-                search_query = f"{category}"
-                country = self.config.get('country', 'Unknown')
-                
-                # Ingest POIs
-                ingested_ids = self.ingester.search_and_ingest(search_query, city, country)
-                
-                self.stats['pois_ingested'] += len(ingested_ids)
-                logger.info(f"✅ {len(ingested_ids)} POIs ingested for {category} in {city}")
-                
-                # Small pause to respect rate limits
-                time.sleep(1)
-                
-            except Exception as e:
-                error_msg = f"Ingestion error {category} in {city}: {e}"
-                logger.error(f"❌ {error_msg}")
-                self.stats['errors'].append(error_msg)
-                continue
+            # Run neighborhood rotation ingestion
+            result = self.ingester.run_neighborhood_rotation_ingestion(city, country)
+            
+            # Update statistics
+            self.stats['pois_ingested'] += result['total_ingested']
+            self.stats['new_pois_detected'] = result['new_pois_detected']
+            self.stats['current_neighborhood'] = result['neighborhood']
+            
+            logger.info(f"✅ Neighborhood rotation completed: {result['total_ingested']} POIs ingested, {result['new_pois_detected']} new POIs detected")
+            logger.info(f"📍 Today's neighborhood: {result['neighborhood']}")
+            
+            return True
+            
+        except Exception as e:
+            error_msg = f"Neighborhood rotation ingestion error: {e}"
+            logger.error(f"❌ {error_msg}")
+            self.stats['errors'].append(error_msg)
+            return False
+    
+    def execute_ingestion_plan(self, plan: List[Dict[str, Any]]) -> bool:
+        """Legacy method - now redirects to neighborhood rotation for cost efficiency"""
+        logger.info("🔄 Redirecting to cost-efficient neighborhood rotation ingestion")
         
-        logger.info(f"📍 Ingestion completed: {self.stats['pois_ingested']} POIs ingested")
-        return True
+        # Extract city from plan
+        city = self.config.get('cities', ['Paris'])[0]
+        return self.execute_neighborhood_rotation_ingestion(city)
     
     def process_social_proofs_and_classification(self) -> bool:
         """Process POIs for social proofs and intelligent classification"""
@@ -300,69 +293,102 @@ class TrendrDataPipeline:
         return True
     
     def detect_poi_updates(self) -> bool:
-        """Detect POIs requiring updates"""
-        logger.info("🔍 Detecting necessary POI updates...")
+        """Detect POIs requiring updates using social proof trends instead of expensive API calls"""
+        logger.info("🔍 Detecting necessary POI updates via social proof analysis...")
         
         try:
             update_interval_days = self.config.get('update_interval_days', 7)
             cutoff_date = datetime.now() - timedelta(days=update_interval_days)
             
-            # Get outdated POIs without recent updates
-            outdated_pois = self.db.client.table('poi')\
-                .select('id,name,google_place_id,updated_at,city,category')\
+            # Get POIs without recent social proof analysis (cheaper than Google API calls)
+            stale_pois = self.db.client.table('poi')\
+                .select('id,name,google_place_id,updated_at,city,category,rating,user_ratings_total')\
                 .lt('updated_at', cutoff_date.isoformat())\
                 .execute()
             
-            if not outdated_pois.data:
+            if not stale_pois.data:
                 logger.info("✅ No POIs requiring updates")
                 return True
             
-            logger.info(f"📊 {len(outdated_pois.data)} POIs require updates")
+            logger.info(f"📊 {len(stale_pois.data)} POIs have stale data")
             
-            # Prioritize POIs to update (limit to respect quotas)
-            high_priority_pois = []
-            for poi in outdated_pois.data:
-                # Check if POI has recent reviews or activity
+            # Smart filtering: Only update POIs showing social proof activity
+            update_candidates = []
+            
+            for poi in stale_pois.data:
                 try:
-                    detailed_info = self.ingester.get_place_details(poi['google_place_id'])
-                    if detailed_info:
-                        # Check significant changes
-                        needs_update = self._poi_needs_update(poi, detailed_info)
-                        if needs_update:
-                            high_priority_pois.append({
-                                'poi_id': poi['id'],
-                                'poi_name': poi['name'],
-                                'google_place_id': poi['google_place_id'],
-                                'reason': needs_update,
-                                'detailed_info': detailed_info
-                            })
+                    # Check if POI shows trending signals via social proof (FREE)
+                    trending_signals = self._detect_trending_signals_free(poi)
                     
-                    # Limit to 20 updates per execution to manage quotas
-                    if len(high_priority_pois) >= 20:
+                    if trending_signals['should_update']:
+                        update_candidates.append({
+                            'poi_id': poi['id'],
+                            'poi_name': poi['name'],
+                            'google_place_id': poi['google_place_id'],
+                            'trending_score': trending_signals['score'],
+                            'reason': trending_signals['reason']
+                        })
+                    
+                    # Limit candidates to respect daily quota (conservative)
+                    if len(update_candidates) >= 20:
                         break
                         
                 except Exception as e:
-                    logger.warning(f"POI verification error {poi['name']}: {e}")
+                    logger.warning(f"Trending detection error {poi['name']}: {e}")
                     continue
             
-            # Perform updates
-            updates_made = 0
-            for update_info in high_priority_pois:
+            logger.info(f"🎯 {len(update_candidates)} POIs show trending activity - will update via Google API")
+            
+            # Now make expensive Google API calls ONLY for trending POIs
+            api_updates_made = 0
+            remaining_quota = self.config['daily_api_limit'] - self.stats.get('api_calls_used', 0)
+            
+            for candidate in update_candidates[:remaining_quota]:
                 try:
-                    success = self._update_poi_from_google(
-                        update_info['poi_id'], 
-                        update_info['detailed_info']
-                    )
-                    if success:
-                        updates_made += 1
-                        logger.info(f"✅ Updated: {update_info['poi_name']} - {update_info['reason']}")
-                        self.stats['pois_updated'] += 1
+                    # Expensive Google API call - only for confirmed trending POIs
+                    detailed_info = self.ingester.get_place_details(candidate['google_place_id'])
+                    if detailed_info:
+                        success = self._update_poi_from_google(
+                            candidate['poi_id'], 
+                            detailed_info
+                        )
+                        if success:
+                            api_updates_made += 1
+                            logger.info(f"✅ API Updated: {candidate['poi_name']} - {candidate['reason']}")
+                            self.stats['pois_updated'] += 1
+                            self.stats['api_calls_used'] = self.stats.get('api_calls_used', 0) + 1
                     
                 except Exception as e:
-                    logger.error(f"POI update error {update_info['poi_name']}: {e}")
+                    logger.error(f"API update error {candidate['poi_name']}: {e}")
                     continue
             
-            logger.info(f"✅ {updates_made} POIs updated successfully")
+            # Update social proof data for remaining POIs (cheaper)
+            social_proof_updates = 0
+            remaining_pois = stale_pois.data[len(update_candidates):]
+            
+            for poi in remaining_pois[:50]:  # Process more via social proof
+                try:
+                    # Use social proof scanner to refresh data (much cheaper)
+                    proofs = self.proof_scanner.enhanced_search_for_poi(
+                        poi['name'],
+                        poi['city'],
+                        poi.get('category', '')
+                    )
+                    
+                    if proofs:
+                        # Update social proof metadata without Google API
+                        self._update_poi_social_metadata(poi['id'], proofs)
+                        social_proof_updates += 1
+                    
+                except Exception as e:
+                    logger.warning(f"Social proof update error {poi['name']}: {e}")
+                    continue
+            
+            logger.info(f"✅ Updates completed:")
+            logger.info(f"   • {api_updates_made} POIs updated via Google API")
+            logger.info(f"   • {social_proof_updates} POIs updated via social proof")
+            logger.info(f"   • API calls saved: {len(stale_pois.data) - api_updates_made}")
+            
             return True
             
         except Exception as e:
@@ -371,29 +397,105 @@ class TrendrDataPipeline:
             self.stats['errors'].append(error_msg)
             return False
     
-    def _poi_needs_update(self, poi: Dict[str, Any], google_data: Dict[str, Any]) -> Optional[str]:
-        """Determine if a POI needs updating and why"""
+    def _detect_trending_signals_free(self, poi: Dict[str, Any]) -> Dict[str, Any]:
+        """Detect trending signals using social proof data WITHOUT Google API calls"""
         
-        # Check rating changes
+        trending_score = 0
+        reasons = []
+        
+        try:
+            # Check social proof activity from our database (FREE)
+            recent_proofs = self.db.client.table('proof_sources')\
+                .select('created_at,authority_score,source_type')\
+                .eq('poi_id', poi['id'])\
+                .gte('created_at', (datetime.now() - timedelta(days=7)).isoformat())\
+                .execute()
+            
+            if recent_proofs.data:
+                trending_score += len(recent_proofs.data) * 10
+                reasons.append(f"Recent social proof activity: {len(recent_proofs.data)} new mentions")
+            
+            # Check if POI has high authority mentions
+            high_authority_proofs = [p for p in recent_proofs.data if p.get('authority_score', 0) > 0.7]
+            if high_authority_proofs:
+                trending_score += len(high_authority_proofs) * 20
+                reasons.append(f"High authority mentions: {len(high_authority_proofs)}")
+            
+            # Check monitoring reports for trending indicators (FREE)
+            recent_reports = self.db.client.table('monitoring_reports')\
+                .select('trend_direction,confidence_score')\
+                .eq('poi_id', poi['id'])\
+                .gte('monitoring_date', (datetime.now() - timedelta(days=3)).isoformat())\
+                .order('monitoring_date', desc=True)\
+                .limit(1)\
+                .execute()
+            
+            if recent_reports.data:
+                report = recent_reports.data[0]
+                if report.get('trend_direction') == 'upward' and report.get('confidence_score', 0) > 0.6:
+                    trending_score += 30
+                    reasons.append(f"Upward trend detected: {report['confidence_score']}")
+            
+            # Age-based scoring: older POIs need updates less frequently
+            poi_age_days = (datetime.now() - datetime.fromisoformat(poi.get('updated_at', '2020-01-01'))).days
+            if poi_age_days > 30:
+                trending_score += 5  # Slight boost for very stale data
+                reasons.append(f"Stale data: {poi_age_days} days old")
+            
+        except Exception as e:
+            logger.warning(f"Error detecting trending signals for {poi.get('name')}: {e}")
+        
+        should_update = trending_score >= 20  # Threshold for API call
+        
+        return {
+            'should_update': should_update,
+            'score': trending_score,
+            'reason': ' | '.join(reasons) if reasons else 'No significant activity'
+        }
+    
+    def _update_poi_social_metadata(self, poi_id: str, proof_sources: List[Dict[str, Any]]) -> bool:
+        """Update POI with social proof metadata without Google API call"""
+        try:
+            # Calculate social proof metrics
+            total_authority = sum(p.get('authority_score', 0) for p in proof_sources)
+            avg_authority = total_authority / len(proof_sources) if proof_sources else 0
+            
+            # Update POI with social proof data only
+            update_data = {
+                'social_proof_score': avg_authority,
+                'proof_sources_count': len(proof_sources),
+                'updated_at': datetime.now().isoformat(),
+                'last_social_sync': datetime.now().isoformat()
+            }
+            
+            result = self.db.client.table('poi')\
+                .update(update_data)\
+                .eq('id', poi_id)\
+                .execute()
+            
+            return bool(result.data)
+            
+        except Exception as e:
+            logger.error(f"Social metadata update error {poi_id}: {e}")
+            return False
+    
+    def _poi_needs_update(self, poi: Dict[str, Any], google_data: Dict[str, Any]) -> Optional[str]:
+        """Determine if a POI needs updating and why - SIMPLIFIED to reduce costs"""
+        
+        # Only check critical changes that affect trending detection
         old_rating = poi.get('rating')
         new_rating = google_data.get('rating')
-        if old_rating and new_rating and abs(float(old_rating) - float(new_rating)) > 0.2:
-            return f"Rating change: {old_rating} → {new_rating}"
+        if old_rating and new_rating and abs(float(old_rating) - float(new_rating)) > 0.3:
+            return f"Significant rating change: {old_rating} → {new_rating}"
         
-        # Check review count changes
+        # Check review count changes (major indicator for trending)
         old_reviews = poi.get('user_ratings_total', 0)
         new_reviews = google_data.get('user_ratings_total', 0)
-        if new_reviews > old_reviews * 1.2:  # 20%+ increase in reviews
-            return f"New reviews: {old_reviews} → {new_reviews}"
+        if new_reviews > old_reviews * 1.5:  # 50%+ increase in reviews
+            return f"Major review increase: {old_reviews} → {new_reviews}"
         
-        # Check schedule changes
-        if 'opening_hours' in google_data:
-            return "Opening hours potentially modified"
-        
-        # Check status changes (temporarily closed, etc.)
-        business_status = google_data.get('business_status')
-        if business_status and business_status != 'OPERATIONAL':
-            return f"Status changed: {business_status}"
+        # Skip expensive checks like opening_hours and business_status
+        # Focus only on trending-relevant data
         
         return None
     
@@ -473,7 +575,7 @@ class TrendrDataPipeline:
             return False
     
     def generate_collections(self) -> bool:
-        """Generate POI collections"""
+        """Generate POI collections with smart frequency"""
         if not self.config.get('collections_enabled', True):
             logger.info("⏭️  Collection generation disabled")
             return True
@@ -482,17 +584,17 @@ class TrendrDataPipeline:
         
         try:
             for city in self.config['cities']:
-                collections = self.collection_gen.generate_contextual_collections(city)
-                
-                # Save collections to DB
-                for collection in collections:
-                    try:
-                        self.db.save_collection(collection)
-                        self.stats['collections_generated'] += 1
-                    except Exception as e:
-                        logger.warning(f"Collection save error: {e}")
-                
-                logger.info(f"✅ {len(collections)} collections generated for {city}")
+                # Check if collections need updating (every 3 days or after significant POI changes)
+                if self._should_regenerate_collections(city):
+                    logger.info(f"🔄 Collections need updating for {city}")
+                    
+                    # Generate collections with AI agent
+                    processed_count, collections = self.collection_gen.generate_collections_for_city(city, use_ai=True)
+                    
+                    self.stats['collections_generated'] += processed_count
+                    logger.info(f"✅ {processed_count} collections processed for {city}")
+                else:
+                    logger.info(f"⏭️ Collections up-to-date for {city}")
         
         except Exception as e:
             error_msg = f"Collection generation error: {e}"
@@ -501,6 +603,43 @@ class TrendrDataPipeline:
             return False
         
         return True
+    
+    def _should_regenerate_collections(self, city: str) -> bool:
+        """Determine if collections need regeneration"""
+        try:
+            from datetime import timedelta
+            
+            # Check last collection update
+            existing_collections = self.db.client.table('collections')\
+                .select('updated_at')\
+                .eq('city', city)\
+                .order('updated_at', desc=True)\
+                .limit(1)\
+                .execute()
+            
+            if not existing_collections.data:
+                logger.info(f"No existing collections for {city} - will create")
+                return True
+            
+            last_update = datetime.fromisoformat(existing_collections.data[0]['updated_at'].replace('Z', '+00:00'))
+            days_since_update = (datetime.now(timezone.utc) - last_update).days
+            
+            # Regenerate if:
+            # 1. More than 3 days since last update
+            # 2. New POIs added today (indicates fresh data)
+            if days_since_update >= 3:
+                logger.info(f"Collections outdated: {days_since_update} days old")
+                return True
+            
+            if self.stats.get('new_pois_detected', 0) > 0:
+                logger.info(f"New POIs detected: {self.stats['new_pois_detected']} - refreshing collections")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logger.warning(f"Error checking collection freshness: {e}")
+            return True  # Err on safe side, regenerate
     
     def cleanup_and_maintenance(self) -> bool:
         """System cleanup and maintenance"""
@@ -529,6 +668,8 @@ class TrendrDataPipeline:
         print("="*60)
         print(f"⏱️  Duration: {duration}")
         print(f"📍 POIs ingested: {self.stats['pois_ingested']}")
+        print(f"🆕 New POIs detected: {self.stats.get('new_pois_detected', 0)}")
+        print(f"🏘️  Current neighborhood: {self.stats.get('current_neighborhood', 'N/A')}")
         print(f"🤖 POIs classified: {self.stats['pois_classified']}")
         print(f"🔄 POIs updated: {self.stats['pois_updated']}")
         print(f"📸 Photos processed: {self.stats['photos_processed']}")

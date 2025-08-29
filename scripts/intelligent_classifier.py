@@ -17,7 +17,7 @@ from collections import Counter
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.database import SupabaseManager
-from scripts.dynamic_neighborhoods import DynamicNeighborhoodCalculator
+# from scripts.dynamic_neighborhoods import DynamicNeighborhoodCalculator  # Not essential
 import config
 
 logging.basicConfig(level=logging.INFO)
@@ -28,13 +28,35 @@ class IntelligentClassifier:
     
     def __init__(self):
         self.db = SupabaseManager()
-        self.neighborhood_calculator = DynamicNeighborhoodCalculator()
+        # self.neighborhood_calculator = DynamicNeighborhoodCalculator()  # Not essential
         
-        # Enhanced contextual tag definitions with temporal tags
+        # Enhanced contextual tag definitions with social proof focus
         self.contextual_tag_definitions = {
-            # TEMPORAL TAGS - NEW: Critical for trend detection
+            # SOCIAL PROOF AUTHORITY TAGS - NEW: Exploit our competitive advantage
+            'michelin_mentioned': {
+                'keywords': ['michelin', 'étoile', 'star', 'guide michelin', 'starred', 'étoilé'],
+                'weight': 2.0,  # Very high weight - premium indicator
+                'min_confidence': 0.4,  # Réduit pour être plus permissif
+                'category': 'authority',
+                'domains_boost': ['guide.michelin.com']
+            },
+            'media_featured': {
+                'keywords': ['le figaro', 'time out', 'conde nast', 'vogue', 'elle', 'grazia', 'featured', 'article', 'press'],
+                'weight': 1.5,
+                'min_confidence': 0.6,
+                'category': 'authority',
+                'domains_boost': ['timeout.com', 'condenast.com', 'lefigaro.fr']
+            },
+            'food_critic_approved': {
+                'keywords': ['critique', 'food critic', 'reviewed', 'évaluation', 'chronique gastronomique'],
+                'weight': 1.4,
+                'min_confidence': 0.7,
+                'category': 'authority'
+            },
+            
+            # TEMPORAL TAGS - Enhanced with social proof patterns
             'new_spot': {
-                'keywords': ['new', 'nouveau', 'just opened', 'vient d\'ouvrir', 'recently opened', 'fresh', 'latest'],
+                'keywords': ['new', 'nouveau', 'just opened', 'vient d\'ouvrir', 'recently opened', 'fresh', 'latest', 'opening'],
                 'weight': 1.2,  # High weight for trend detection
                 'min_confidence': 0.3,
                 'category': 'temporal'
@@ -50,6 +72,45 @@ class IntelligentClassifier:
                 'weight': 0.9,
                 'min_confidence': 0.5,
                 'category': 'temporal'
+            },
+            
+            # CULINARY EXPERTISE TAGS - NEW: Based on social proof analysis
+            'chef_driven': {
+                'keywords': ['chef', 'owner-chef', 'head chef', 'executive chef', 'culinary', 'gastronomic', 'gastronomy', 
+                           'chef propriétaire', 'chef étoilé', 'culinaire', 'gastronomique', 'gastronomie'],
+                'weight': 1.3,
+                'min_confidence': 0.6,
+                'category': 'culinary'
+            },
+            'wine_specialist': {
+                'keywords': ['wine', 'sommelier', 'wine list', 'natural wine', 'vin', 'carte des vins', 'wine bar', 'wine selection',
+                           'vins naturels', 'cave à vin', 'accord mets vins', 'dégustation', 'vignoble'],
+                'weight': 1.2,
+                'min_confidence': 0.5,
+                'category': 'culinary'
+            },
+            'innovative_cuisine': {
+                'keywords': ['innovative', 'creative', 'inventive', 'modern', 'contemporary', 'fusion', 'avant-garde',
+                           'innovant', 'créatif', 'inventif', 'moderne', 'contemporain', 'créativité culinaire'],
+                'weight': 1.1,
+                'min_confidence': 0.6,
+                'category': 'culinary'
+            },
+            
+            # BUSINESS VALUE TAGS - NEW: Actionable for collections
+            'reservation_essential': {
+                'keywords': ['reservation', 'réservation', 'booking', 'fully booked', 'complet', 'book ahead', 'réserver',
+                           'réserver une table', 'indispensable de réserver', 'obligatoire de réserver'],
+                'weight': 1.0,
+                'min_confidence': 0.5,
+                'category': 'business'
+            },
+            'good_value': {
+                'keywords': ['value', 'affordable', 'reasonable', 'worth it', 'rapport qualité prix', 'bon rapport', 'price',
+                           'abordable', 'raisonnable', 'ça vaut le coup', 'bon plan', 'pas cher', 'tarif correct'],
+                'weight': 0.9,
+                'min_confidence': 0.4,
+                'category': 'business'
             },
             
             # Experience-based tags
@@ -172,21 +233,52 @@ class IntelligentClassifier:
             'hidden_gem': ['hidden', 'gem', 'secret', 'undiscovered', 'local', 'authentic', 'unique', 'special']
         }
     
-    def extract_all_contextual_tags(self, text_content: str, poi_name: str = "") -> Dict[str, Dict[str, Any]]:
-        """Extract all contextual tags from text content with confidence scores."""
+    def extract_all_contextual_tags(self, text_content: str, poi_name: str = "", 
+                                  proof_sources: List[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
+        """Extract all contextual tags from text content and social proof sources with confidence scores."""
         detected_tags = {}
         text_lower = text_content.lower()
         
         # Split into sentences for context analysis
         sentences = re.split(r'[.!?]+', text_content)
         
+        # NEW: Analyze social proof sources for domain authority and richer content
+        domain_authority_boost = {}
+        source_content = text_content  # Start with base content
+        
+        if proof_sources:
+            for proof in proof_sources:
+                domain = proof.get('domain', '')
+                snippet = proof.get('snippet', '')
+                page_title = proof.get('page_title', '')
+                
+                # Add proof source content to analysis
+                source_content += f" {snippet} {page_title}"
+                
+                # Domain authority boosting
+                if domain in ['guide.michelin.com', 'timeout.com', 'zagat.com']:
+                    domain_authority_boost[domain] = 2.0
+                elif domain in ['tripadvisor.com', 'yelp.com', 'foursquare.com']:
+                    domain_authority_boost[domain] = 1.3
+                elif domain.endswith(('.fr', '.com')) and 'food' in domain:
+                    domain_authority_boost[domain] = 1.2
+        
+        # Enhanced text analysis with social proof content
+        enhanced_text_lower = source_content.lower()
+        
         for tag_name, tag_config in self.contextual_tag_definitions.items():
             tag_score = 0.0
             matched_keywords = []
             sources_count = 0
+            domain_boost_applied = False
+            
+            # DEBUG pour Michelin
+            if tag_name == 'michelin_mentioned':
+                print(f"DEBUG: Testing {tag_name} with keywords: {tag_config['keywords']}")
+                print(f"DEBUG: Text contains: {[kw for kw in tag_config['keywords'] if kw in enhanced_text_lower]}")
             
             for keyword in tag_config['keywords']:
-                if keyword in text_lower:
+                if keyword in enhanced_text_lower:
                     # Context validation - ensure it's about the POI
                     poi_context_weight = 0.4  # Default weight
                     
@@ -208,7 +300,26 @@ class IntelligentClassifier:
                     else:
                         poi_context_weight = 0.7  # Default when no POI name
                     
-                    keyword_contribution = tag_config['weight'] * poi_context_weight
+                    # NEW: Apply domain boost for authority tags
+                    domain_multiplier = 1.0
+                    if tag_config.get('domains_boost') and proof_sources:
+                        for proof in proof_sources:
+                            if (proof.get('domain') in tag_config['domains_boost'] and 
+                                keyword in proof.get('snippet', '').lower()):
+                                domain_multiplier = 2.0
+                                domain_boost_applied = True
+                                break
+                    
+                    # General domain authority boost
+                    for domain, boost in domain_authority_boost.items():
+                        if proof_sources:
+                            for proof in proof_sources:
+                                if (proof.get('domain') == domain and 
+                                    keyword in proof.get('snippet', '').lower()):
+                                    domain_multiplier = max(domain_multiplier, boost)
+                                    break
+                    
+                    keyword_contribution = tag_config['weight'] * poi_context_weight * domain_multiplier
                     tag_score += keyword_contribution
                     matched_keywords.append(keyword)
                     sources_count += 1
@@ -221,6 +332,10 @@ class IntelligentClassifier:
                 
                 # Final confidence combines raw score with keyword diversity
                 final_confidence = (raw_confidence * 0.7) + (keyword_diversity * 0.3)
+                
+                # DEBUG: Pour identifier le problème
+                if tag_name == 'michelin_mentioned' and matched_keywords:
+                    print(f"DEBUG {tag_name}: score={tag_score:.2f}, raw_conf={raw_confidence:.2f}, diversity={keyword_diversity:.2f}, final={final_confidence:.2f}, min_req={tag_config['min_confidence']:.2f}")
                 
                 if final_confidence >= tag_config['min_confidence']:
                     detected_tags[tag_name] = {
@@ -462,8 +577,8 @@ class IntelligentClassifier:
         # NEW: Analyze temporal status first
         temporal_analysis = self.analyze_poi_temporal_status(poi, proof_sources)
         
-        # Extract all contextual tags
-        contextual_tags = self.extract_all_contextual_tags(combined_text, poi_name)
+        # Extract all contextual tags with social proof analysis
+        contextual_tags = self.extract_all_contextual_tags(combined_text, poi_name, proof_sources)
         
         # ADD temporal tag based on analysis
         if temporal_analysis['confidence'] > 0.5:
@@ -534,60 +649,31 @@ class IntelligentClassifier:
         }
     
     def update_poi_in_database(self, poi_id: str, classification_result: Dict[str, Any]) -> bool:
-        """Update POI in database with modern classification results."""
+        """Update POI in database with classification results - FIXED to use correct columns."""
         try:
-            # Try clean column names first
+            # Use the CORRECT column names that exist in the schema
             update_data = {
                 'primary_mood': classification_result['primary_mood'],
-                'mood_confidence': classification_result['mood_confidence'],
-                'tags': classification_result['contextual_tags'],  # Clean name: tags instead of contextual_tags
-                'classification_data': classification_result['classification_metadata'],  # Clean name
-                'classified_at': datetime.now(timezone.utc).isoformat(),  # Clean name
-                'temporal_status': classification_result['temporal_status'],  # NEW: temporal status
-                'temporal_confidence': classification_result['temporal_confidence']  # NEW: temporal confidence
+                'mood_confidence': int(classification_result['mood_confidence'] * 100),  # Convert to 0-100
+                'tags': classification_result['contextual_tags'],
+                'classification_data': classification_result['classification_metadata'], 
+                'last_classified': datetime.now(timezone.utc).isoformat()
             }
             
-            try:
-                result = self.db.client.table('poi')\
-                    .update(update_data)\
-                    .eq('id', poi_id)\
-                    .execute()
-                
-                return len(result.data) > 0
-            except Exception as schema_error:
-                # Fallback: try old column names
-                logger.warning(f"Clean schema not available, trying old names: {schema_error}")
-                old_update_data = {
-                    'primary_mood': classification_result['primary_mood'],
-                    'mood_confidence': classification_result['mood_confidence'],
-                    'contextual_tags': classification_result['contextual_tags'],
-                    'classification_metadata': classification_result['classification_metadata'],
-                    'last_classified': datetime.now(timezone.utc).isoformat()
-                }
-                
-                try:
-                    result = self.db.client.table('poi')\
-                        .update(old_update_data)\
-                        .eq('id', poi_id)\
-                        .execute()
-                    
-                    return len(result.data) > 0
-                except Exception as final_error:
-                    # Final fallback: update only mood_tag for backward compatibility
-                    logger.warning(f"Using final fallback to mood_tag: {final_error}")
-                    fallback_data = {
-                        'mood_tag': classification_result['primary_mood'].title()
-                    }
-                    
-                    result = self.db.client.table('poi')\
-                        .update(fallback_data)\
-                        .eq('id', poi_id)\
-                        .execute()
-                    
-                    return len(result.data) > 0
+            result = self.db.client.table('poi')\
+                .update(update_data)\
+                .eq('id', poi_id)\
+                .execute()
+            
+            if result.data:
+                logger.info(f"✅ Updated POI {poi_id} with mood: {classification_result['primary_mood']}")
+                return True
+            else:
+                logger.warning(f"❌ No rows updated for POI {poi_id}")
+                return False
                 
         except Exception as e:
-            logger.error(f"Error updating POI {poi_id}: {e}")
+            logger.error(f"❌ Database update failed for POI {poi_id}: {e}")
             return False
     
     def classify_single_poi(self, poi_id: str) -> Optional[Dict[str, Any]]:

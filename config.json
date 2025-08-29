@@ -1,6 +1,6 @@
 {
   "pipeline_config": {
-    "cities": ["Montreal"],
+    "cities": ["Paris"],
     "poi_categories": [
       "restaurant",
       "cafe", 
@@ -13,9 +13,9 @@
       "gym",
       "spa"
     ],
-    "daily_api_limit": 95,
-    "batch_size": 20,
-    "max_pois_per_category": 100,
+    "daily_api_limit": 950,
+    "batch_size": 25,
+    "max_pois_per_category": 150,
     "update_interval_days": 7,
     "social_proof_enabled": true,
     "collections_enabled": true,
@@ -38,6 +38,25 @@
     "cache_ttl_hours": 48,
     "authority_threshold": 0.3,
     "min_proof_sources": 1
+  },
+  
+  "api_cost_optimization": {
+    "use_basic_fields_only": true,
+    "avoid_expensive_fields": ["photos", "reviews", "opening_hours", "formatted_phone_number"],
+    "optimized_fields": "place_id,name,formatted_address,geometry,types,rating,user_ratings_total,website,price_level",
+    "batch_place_details": true,
+    "cache_place_details": 168,
+    "daily_api_budget": 1.5,
+    "max_requests_per_day": 950,
+    "free_quota_daily": 950,
+    "cost_per_request": 0.008,
+    "smart_update_strategy": {
+      "social_proof_first": true,
+      "trending_threshold": 20,
+      "max_api_updates_per_day": 20,
+      "prioritize_high_authority": true,
+      "update_interval_multiplier": 2.0
+    }
   },
   
   "classification_config": {

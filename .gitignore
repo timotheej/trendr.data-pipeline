@@ -54,6 +54,7 @@ Thumbs.db
 *.db
 data_pipeline.log
 pipeline_*.log
+monitoring.log
 
 # Cache directories
 cache/
@@ -135,18 +136,15 @@ cache/*
 *.pickle
 *.pkl
 
-# Monitoring data
-monitoring/*.log
-monitoring/data/
+# Cache directories
 
 # Local scripts (not for production)
 scripts/local_*
 scripts/dev_*
 scripts/test_local*
 
-# Documentation builds
-docs/_build/
-site/
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
 
 # Coverage reports
 .coverage.*

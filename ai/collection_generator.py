@@ -48,9 +48,9 @@ class CollectionGenerator:
             # TEMPORAL TRENDING - Critical for Trendr SEO & UX
             'hot_new_spots': {
                 'title': 'Hot New Spots',
-                'slug': 'hot-new-spots-montreal',
+                'slug_template': 'hot-new-spots-{city}',
                 'description': 'The newest hotspots everyone is talking about - fresh discoveries creating buzz',
-                'seo_description': 'Discover Montreal\'s hottest new restaurants, bars and cafes that just opened',
+                'seo_description_template': 'Discover {city}\'s hottest new restaurants, bars and cafes that just opened',
                 'required_tags': ['nouveau'],
                 'excluded_tags': ['établi'],
                 'min_confidence': 0.4,
@@ -58,9 +58,9 @@ class CollectionGenerator:
             },
             'rising_stars': {
                 'title': 'Rising Stars',
-                'slug': 'rising-star-venues-montreal', 
+                'slug_template': 'rising-star-venues-{city}', 
                 'description': 'Places gaining momentum and building their reputation - tomorrow\'s classics',
-                'seo_description': 'Montreal\'s rising star restaurants and bars gaining popularity fast',
+                'seo_description_template': '{city}\'s rising star restaurants and bars gaining popularity fast',
                 'required_tags': ['émergent'],
                 'excluded_tags': [],
                 'min_confidence': 0.5,
@@ -68,9 +68,9 @@ class CollectionGenerator:
             },
             'proven_classics': {
                 'title': 'Proven Classics',
-                'slug': 'classic-montreal-restaurants',
+                'slug_template': 'classic-{city}-restaurants',
                 'description': 'Established favorites that maintain their excellence - trusted quality',
-                'seo_description': 'Montreal\'s best established restaurants and bars with proven track records',
+                'seo_description_template': '{city}\'s best established restaurants and bars with proven track records',
                 'required_tags': ['établi'],
                 'excluded_tags': [],
                 'min_confidence': 0.6,
@@ -80,9 +80,9 @@ class CollectionGenerator:
             # LIFESTYLE-SPECIFIC COLLECTIONS - SEO optimized
             'digital_nomad_cafes': {
                 'title': 'Digital Nomad Cafes',
-                'slug': 'best-work-cafes-montreal',
+                'slug_template': 'best-work-cafes-{city}',
                 'description': 'Perfect workspaces with reliable WiFi, power outlets, and productive vibes',
-                'seo_description': 'Best cafes for remote work in Montreal with WiFi, power outlets and quiet atmosphere',
+                'seo_description_template': 'Best cafes for remote work in {city} with WiFi, power outlets and quiet atmosphere',
                 'required_tags': ['work-friendly'],
                 'excluded_tags': ['vibrant'],
                 'min_confidence': 0.6,
@@ -90,9 +90,9 @@ class CollectionGenerator:
             },
             'romantic_date_spots': {
                 'title': 'Romantic Date Spots',
-                'slug': 'romantic-restaurants-montreal', 
+                'slug_template': 'romantic-restaurants-{city}', 
                 'description': 'Intimate venues perfect for memorable dates and special occasions',
-                'seo_description': 'Most romantic restaurants and bars in Montreal for perfect date nights',
+                'seo_description_template': 'Most romantic restaurants and bars in {city} for perfect date nights',
                 'required_tags': ['date-spot'],
                 'excluded_tags': ['group-friendly', 'work-friendly'],
                 'min_confidence': 0.5,
@@ -100,9 +100,9 @@ class CollectionGenerator:
             },
             'instagram_worthy': {
                 'title': 'Instagram-Worthy Spots',
-                'slug': 'instagrammable-places-montreal',
+                'slug_template': 'instagrammable-places-{city}',
                 'description': 'Photogenic venues with stunning aesthetics perfect for your feed',
-                'seo_description': 'Most Instagram-worthy restaurants and cafes in Montreal with beautiful design',
+                'seo_description_template': 'Most Instagram-worthy restaurants and cafes in {city} with beautiful design',
                 'required_tags': ['photo-worthy'],
                 'excluded_tags': [],
                 'min_confidence': 0.5,
@@ -112,9 +112,9 @@ class CollectionGenerator:
             # TIME-BASED EXPERIENCES - SEO optimized
             'breakfast_champions': {
                 'title': 'Breakfast Champions',
-                'slug': 'best-breakfast-montreal',
+                'slug_template': 'best-breakfast-{city}',
                 'description': 'Perfect morning spots for coffee, brunch and starting your day right',
-                'seo_description': 'Best breakfast and brunch spots in Montreal for perfect morning meals',
+                'seo_description_template': 'Best breakfast and brunch spots in {city} for perfect morning meals',
                 'required_tags': ['morning-spot'],
                 'excluded_tags': ['evening-spot'],
                 'min_confidence': 0.5,
@@ -122,9 +122,9 @@ class CollectionGenerator:
             },
             'evening_vibes': {
                 'title': 'Evening Vibes',
-                'slug': 'best-evening-bars-montreal',
+                'slug_template': 'best-evening-bars-{city}',
                 'description': 'Perfect venues for dinner, drinks and unwinding after a long day',
-                'seo_description': 'Best evening bars and restaurants in Montreal for dinner and cocktails',
+                'seo_description_template': 'Best evening bars and restaurants in {city} for dinner and cocktails',
                 'required_tags': ['evening-spot'],
                 'excluded_tags': ['morning-spot'],
                 'min_confidence': 0.5,
@@ -134,9 +134,9 @@ class CollectionGenerator:
             # INSIDER COLLECTIONS - SEO optimized  
             'locals_only': {
                 'title': 'Locals Only',
-                'slug': 'local-favorite-spots-montreal',
+                'slug_template': 'local-favorite-spots-{city}',
                 'description': 'Authentic neighborhood gems loved by regulars - off the tourist radar',
-                'seo_description': 'Hidden local favorites in Montreal loved by residents but unknown to tourists',
+                'seo_description_template': 'Hidden local favorites in {city} loved by residents but unknown to tourists',
                 'required_tags': ['local-favorite'],
                 'excluded_tags': ['tourist-friendly'],
                 'min_confidence': 0.6,
@@ -144,9 +144,9 @@ class CollectionGenerator:
             },
             'scene_setters': {
                 'title': 'Scene Setters',
-                'slug': 'trendy-hotspots-montreal',
-                'description': 'Hip venues defining Montreal\'s contemporary culture - where trends are born',
-                'seo_description': 'Montreal\'s trendiest restaurants and bars where the cool crowd gathers',
+                'slug_template': 'trendy-hotspots-{city}',
+                'description': 'Hip venues defining the city\'s contemporary culture - where trends are born',
+                'seo_description_template': '{city}\'s trendiest restaurants and bars where the cool crowd gathers',
                 'required_tags': ['trendy'],
                 'excluded_tags': ['authentic', 'peaceful'],
                 'min_confidence': 0.5,
@@ -154,9 +154,9 @@ class CollectionGenerator:
             },
             'one_of_a_kind': {
                 'title': 'One of a Kind',
-                'slug': 'unique-restaurants-montreal',
+                'slug_template': 'unique-restaurants-{city}',
                 'description': 'Distinctive venues with unique character that can\'t be found elsewhere',
-                'seo_description': 'Most unique and distinctive restaurants in Montreal with special character',
+                'seo_description_template': 'Most unique and distinctive restaurants in {city} with special character',
                 'required_tags': ['unique'],
                 'excluded_tags': [],
                 'min_confidence': 0.5,
@@ -355,26 +355,35 @@ class CollectionGenerator:
                         [poi['id'] for poi in selected_pois]
                     )
                     
+                    # Generate city-specific slug and description
+                    city_slug = city.lower().replace(' ', '-').replace('ème', 'e')
+                    slug = template.get('slug_template', template['title'].lower().replace(' ', '-')).format(city=city_slug)
+                    seo_description = template.get('seo_description_template', template['description']).format(city=city)
+                    
+                    # Determine country based on city
+                    country = self._get_country_for_city(city)
+                    
                     collection_data = {
                         'title': template['title'],
                         'type': 'contextual',
                         'description': template['description'],
                         'city': city,
+                        'country': country,
                         'poi_ids': [poi['id'] for poi in selected_pois],
                         'cover_photo': cover_photo,
                         'required_tags': template['required_tags'],
                         'excluded_tags': template['excluded_tags'],
                         'min_confidence': template['min_confidence'],
                         'metadata': {
-                            'generated_by': 'collection_generator_v4_seo',
+                            'generated_by': 'collection_generator_v5_fixed',
                             'template_used': template_key,
                             'avg_match_score': sum(poi['match_score'] for poi in selected_pois) / len(selected_pois),
                             'poi_count': len(selected_pois),
                             'generation_timestamp': datetime.now(timezone.utc).isoformat(),
                             'seo_optimized': True,
                             'seo_data': {
-                                'slug': template.get('slug', template['title'].lower().replace(' ', '-')),
-                                'seo_description': template.get('seo_description', template['description']),
+                                'slug': slug,
+                                'seo_description': seo_description,
                                 'priority': template.get('priority', 99)
                             },
                             'tag_criteria': {
@@ -458,13 +467,30 @@ class CollectionGenerator:
         except Exception as e:
             logger.error(f"Error generating collections for {city}: {e}")
             return 0, []
+    
+    def _get_country_for_city(self, city: str) -> str:
+        """Determine country based on city name"""
+        city_lower = city.lower()
+        
+        # French cities
+        french_cities = ['paris', 'lyon', 'marseille', 'toulouse', 'nice', 'nantes', 'strasbourg', 'montpellier']
+        if any(french_city in city_lower for french_city in french_cities):
+            return 'France'
+        
+        # Canadian cities  
+        canadian_cities = ['montreal', 'toronto', 'vancouver', 'ottawa', 'quebec', 'calgary', 'edmonton']
+        if any(canadian_city in city_lower for canadian_city in canadian_cities):
+            return 'Canada'
+        
+        # Default fallback
+        return 'Unknown'
 
 def main():
     """Main entry point for collection generation."""
     import argparse
     
     parser = argparse.ArgumentParser(description='Generate Contextual Tag-Based Collections')
-    parser.add_argument('--city', default='Montreal', help='City to generate collections for')
+    parser.add_argument('--city', default='Paris', help='City to generate collections for')
     parser.add_argument('--ai', action='store_true', help='Use AI-enhanced generation')
     parser.add_argument('--test', action='store_true', help='Test mode - show collection templates')
     

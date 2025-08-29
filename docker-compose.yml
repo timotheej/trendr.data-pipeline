@@ -1,0 +1,105 @@
+# Docker Compose pour Trendr Data Pipeline
+# Version simplifiée et optimisée
+
+services:
+  # Service principal de monitoring autonome
+  trendr-monitoring:
+    build: .
+    container_name: trendr-monitoring
+    restart: unless-stopped
+    
+    environment:
+      # Configuration Supabase (REQUIS)
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_KEY=${SUPABASE_KEY}
+      
+      # APIs Google (REQUIS)
+      - GOOGLE_PLACES_API_KEY=${GOOGLE_PLACES_API_KEY}
+      - GOOGLE_CUSTOM_SEARCH_API_KEY=${GOOGLE_CUSTOM_SEARCH_API_KEY}
+      - GOOGLE_CUSTOM_SEARCH_ENGINE_ID=${GOOGLE_CUSTOM_SEARCH_ENGINE_ID}
+      
+      # Configuration système
+      - TZ=Europe/Paris
+      - PYTHON_ENV=production
+      - LOG_LEVEL=INFO
+      
+    volumes:
+      # Persistance des logs
+      - trendr-logs:/app/logs
+      - trendr-photos:/app/photos
+      - trendr-cache:/app/cache
+      
+    networks:
+      - trendr-network
+      
+    # Commande : monitoring system en daemon
+    command: ["python3", "monitoring_system.py", "--daemon"]
+    
+    healthcheck:
+      test: ["CMD", "python3", "/app/healthcheck.py"]
+      interval: 60s
+      timeout: 30s
+      start_period: 120s
+      retries: 3
+    
+    # Limites de ressources optimisées
+    deploy:
+      resources:
+        limits:
+          memory: 1.5G
+          cpus: '1.0'
+        reservations:
+          memory: 512M
+          cpus: '0.25'
+      restart_policy:
+        condition: on-failure
+        delay: 30s
+        max_attempts: 3
+
+  # Service de pipeline pour exécution manuelle
+  trendr-pipeline:
+    build: .
+    container_name: trendr-pipeline
+    restart: "no"  # Exécution manuelle uniquement
+    
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_KEY=${SUPABASE_KEY}
+      - GOOGLE_PLACES_API_KEY=${GOOGLE_PLACES_API_KEY}
+      - GOOGLE_CUSTOM_SEARCH_API_KEY=${GOOGLE_CUSTOM_SEARCH_API_KEY}
+      - GOOGLE_CUSTOM_SEARCH_ENGINE_ID=${GOOGLE_CUSTOM_SEARCH_ENGINE_ID}
+      - TZ=Europe/Paris
+      
+    volumes:
+      - trendr-logs:/app/logs
+      - trendr-photos:/app/photos
+      - trendr-cache:/app/cache
+      
+    networks:
+      - trendr-network
+      
+    # Commande par défaut pour test
+    command: ["python3", "run_pipeline.py", "--city", "Paris", "--mode", "collections"]
+    
+    profiles:
+      - manual  # Démarre seulement avec --profile manual
+
+# Volumes persistants
+volumes:
+  trendr-logs:
+    driver: local
+    name: trendr-logs
+      
+  trendr-photos:
+    driver: local
+    name: trendr-photos
+    
+  trendr-cache:
+    driver: local
+    name: trendr-cache
+
+# Réseau isolé
+networks:
+  trendr-network:
+    driver: bridge
+    name: trendr-network
