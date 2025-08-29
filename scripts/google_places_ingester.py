@@ -486,7 +486,7 @@ class GooglePlacesIngester:
                 category_new_pois = 0
                 category_total_ingested = 0
                 
-                for place in places[:3]:  # LIMIT TO 3 PLACES PER CATEGORY FOR COST CONTROL
+                for place in places[:5]:  # LIMIT TO 5 PLACES PER CATEGORY FOR $30/MONTH BUDGET
                     try:
                         place_id = place.get('place_id')
                         if not place_id:

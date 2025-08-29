@@ -13,9 +13,9 @@
       "gym",
       "spa"
     ],
-    "daily_api_limit": 950,
+    "daily_api_limit": 150,
     "batch_size": 25,
-    "max_pois_per_category": 150,
+    "max_pois_per_category": 200,
     "update_interval_days": 7,
     "social_proof_enabled": true,
     "collections_enabled": true,

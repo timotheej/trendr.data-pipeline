@@ -641,6 +641,32 @@ class TrendrDataPipeline:
             logger.warning(f"Error checking collection freshness: {e}")
             return True  # Err on safe side, regenerate
     
+    def generate_seo_pages(self) -> bool:
+        """Generate SEO pages for all collections."""
+        logger.info("🔍 Generating SEO pages for collections...")
+        
+        try:
+            seo_pages_count = 0
+            
+            for city in self.config['cities']:
+                try:
+                    seo_pages = self.collection_gen.generate_seo_pages_for_collections(city)
+                    seo_pages_count += len(seo_pages)
+                    logger.info(f"✅ Generated {len(seo_pages)} SEO pages for {city}")
+                    
+                except Exception as e:
+                    logger.error(f"Error generating SEO pages for {city}: {e}")
+                    self.stats['errors'].append(f"SEO generation failed for {city}: {e}")
+            
+            self.stats['seo_pages_generated'] = seo_pages_count
+            logger.info(f"🔍 Total SEO pages generated: {seo_pages_count}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Critical error in SEO page generation: {e}")
+            self.stats['errors'].append(f"SEO generation critical error: {e}")
+            return False
+    
     def cleanup_and_maintenance(self) -> bool:
         """System cleanup and maintenance"""
         logger.info("🧹 Cleanup and maintenance...")
@@ -675,6 +701,7 @@ class TrendrDataPipeline:
         print(f"📸 Photos processed: {self.stats['photos_processed']}")
         print(f"📞 API calls used: {self.stats['api_calls_used']}/{self.config['daily_api_limit']}")
         print(f"🗂️  Collections generated: {self.stats['collections_generated']}")
+        print(f"🔍 SEO pages generated: {self.stats.get('seo_pages_generated', 0)}")
         print(f"❌ Errors: {len(self.stats['errors'])}")
         
         if self.stats['errors']:
@@ -715,6 +742,9 @@ class TrendrDataPipeline:
             
             # 8. Collection generation
             self.generate_collections()
+            
+            # 8b. SEO page generation
+            self.generate_seo_pages()
             
             # 9. Cleanup and maintenance
             self.cleanup_and_maintenance()
