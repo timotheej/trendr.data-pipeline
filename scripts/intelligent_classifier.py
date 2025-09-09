@@ -368,7 +368,7 @@ class IntelligentClassifierV4:
         else:
             return 'hold'
     
-    def score_poi(self, poi: Dict[str, Any], force: bool = False) -> Optional[Dict[str, Any]]:
+    def score_poi(self, poi: Dict[str, Any], force: bool = False, explain: bool = False) -> Optional[Dict[str, Any]]:
         """Score a single POI with all Sprint 4 metrics"""
         try:
             poi_id = poi['id']
@@ -386,11 +386,11 @@ class IntelligentClassifierV4:
                     except:
                         pass
             
-            # Calculate scores
-            authority_score = self.calculate_authority_score(poi_id)
-            review_score = self.calculate_review_score(poi)
-            momentum_score = self.calculate_momentum_score(poi)
-            gatto_score = self.calculate_gatto_score(authority_score, review_score, momentum_score)
+            # Calculate scores - clamp to [0,100]
+            authority_score = max(0.0, min(100.0, self.calculate_authority_score(poi_id)))
+            review_score = max(0.0, min(100.0, self.calculate_review_score(poi)))
+            momentum_score = max(0.0, min(100.0, self.calculate_momentum_score(poi)))
+            gatto_score = max(0.0, min(100.0, self.calculate_gatto_score(authority_score, review_score, momentum_score)))
             
             # Calculate badges
             badges = self.calculate_badges(poi, authority_score, review_score, momentum_score)
@@ -413,7 +413,20 @@ class IntelligentClassifierV4:
                 'scored_at': datetime.now(timezone.utc).isoformat()
             }
             
-            logger.info(f"✅ {poi['name']}: Gatto={gatto_score:.1f} (A:{authority_score:.1f}, R:{review_score:.1f}, M:{momentum_score:.1f}) | {eligibility_status} | {len(badges)} badges")
+            # Enhanced logging with explain mode
+            if explain:
+                logger.info(f"🔍 EXPLAIN {poi['name']}:")
+                logger.info(f"  Authority Score: {authority_score:.1f}/100")
+                logger.info(f"  Review Score: {review_score:.1f}/100 (rating: {poi.get('rating', 'N/A')}, reviews: {poi.get('reviews_count', 0)})")
+                logger.info(f"  Momentum Score: {momentum_score:.1f}/100")
+                logger.info(f"  Weights: Authority×0.5 + Review×0.3 + Momentum×0.2")
+                logger.info(f"  Gatto Score: {authority_score:.1f}×0.5 + {review_score:.1f}×0.3 + {momentum_score:.1f}×0.2 = {gatto_score:.1f}/100")
+                logger.info(f"  Status Triggers: Gatto≥60 AND (Authority≥40 OR Review≥70) → approved")
+                logger.info(f"  Status Triggers: Gatto≥50 → eligible, else hold")
+                logger.info(f"  Badge Triggers: new={poi.get('first_seen_at', 'N/A')[:10] if poi.get('first_seen_at') else 'N/A'}, trending=momentum≥65")
+                logger.info(f"  Result: {eligibility_status.upper()}, badges={badges}")
+            else:
+                logger.info(f"✅ {poi['name']}: Gatto={gatto_score:.1f} (A:{authority_score:.1f}, R:{review_score:.1f}, M:{momentum_score:.1f}) | {eligibility_status} | {len(badges)} badges")
             
             return result
             
@@ -422,14 +435,14 @@ class IntelligentClassifierV4:
             return None
     
     def update_poi_scores(self, poi_id: str, scores: Dict[str, Any]) -> bool:
-        """Update POI scores in database"""
+        """Update POI scores in database with last_scored_at"""
         try:
             update_data = {
                 'gatto_score': scores['gatto_score'],
                 'trend_score': scores['trend_score'],
                 'badges': scores['badges'],  # Store as array directly, not JSON string
                 'eligibility_status': scores['eligibility_status'],
-                'last_scored_at': scores['scored_at']
+                'last_scored_at': datetime.now(timezone.utc).isoformat()  # Always update timestamp
             }
             
             result = self.db.client.table('poi')\
@@ -443,10 +456,10 @@ class IntelligentClassifierV4:
             logger.error(f"Error updating scores for POI {poi_id}: {e}")
             return False
     
-    def score_city_pois(self, city_slug: str, force: bool = False) -> Dict[str, Any]:
+    def score_city_pois(self, city_slug: str, force: bool = False, limit: int = None, explain: bool = False) -> Dict[str, Any]:
         """Score POIs for a city (maj ≤7j OU jamais scorés, skip si last_scored_at ≤ 24h sauf --force)"""
         try:
-            logger.info(f"🎯 Starting city scoring: {city_slug}")
+            logger.info(f"🎯 Starting city scoring: {city_slug} (limit={limit}, explain={explain})")
             
             # Get POIs that need scoring
             cutoff_date = datetime.now(timezone.utc) - timedelta(days=7)
@@ -458,6 +471,13 @@ class IntelligentClassifierV4:
             # Filter for POIs updated ≤7j OR never scored
             if not force:
                 query = query.or_(f'updated_at.gte.{cutoff_date.isoformat()},last_scored_at.is.null')
+            
+            # Order by most recent to score: last_scored_at NULL/ancien first, then updated_at DESC
+            query = query.order('last_scored_at', desc=False, nullsfirst=True).order('updated_at', desc=True)
+            
+            # Apply limit if specified
+            if limit and limit > 0:
+                query = query.limit(limit)
             
             result = query.execute()
             candidate_pois = result.data
@@ -480,7 +500,7 @@ class IntelligentClassifierV4:
                 try:
                     old_status = poi.get('eligibility_status', 'unknown')
                     
-                    scores = self.score_poi(poi, force=force)
+                    scores = self.score_poi(poi, force=force, explain=explain)
                     results['processed'] += 1
                     
                     if scores is None:
@@ -731,6 +751,13 @@ def main():
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     parser.add_argument('--run-mocks', action='store_true', help='Run mock tests without network calls')
     
+    # New arguments for pipeline compatibility
+    parser.add_argument('--limit', type=int, help='Limit number of POIs to process (with --score-city)')
+    parser.add_argument('--explain', action='store_true', help='Show detailed score components and reasoning')
+    
+    # Alias for compatibility
+    parser.add_argument('--city', help='Alias for --score-city')
+    
     args = parser.parse_args()
     
     if args.debug:
@@ -738,25 +765,55 @@ def main():
     
     if args.run_mocks:
         run_mock_tests()
-        return
+        sys.exit(0)
     
-    classifier = IntelligentClassifierV4()
-    
-    if args.score_city:
-        result = classifier.score_city_pois(args.score_city, force=args.force)
-        print(f"\n🎯 City Scoring Results:")
-        for key, value in result.items():
-            if key not in ['scores']:
-                print(f"  {key}: {value}")
+    try:
+        classifier = IntelligentClassifierV4()
         
-    elif args.score_poi:
-        result = classifier.score_single_poi(args.score_poi)
-        print(f"\n🎯 POI Scoring Result:")
-        for key, value in result.items():
-            print(f"  {key}: {value}")
+        # Handle city argument (both --city and --score-city)
+        city_to_score = args.score_city or args.city
+        
+        if city_to_score:
+            result = classifier.score_city_pois(city_to_score, force=args.force, limit=args.limit, explain=args.explain)
+            
+            if 'error' in result:
+                logger.error(f"Error scoring city: {result['error']}")
+                sys.exit(1)
+            
+            print(f"\n🎯 City Scoring Results:")
+            for key, value in result.items():
+                if key not in ['scores']:
+                    print(f"  {key}: {value}")
+            
+            # Print processed count for orchestrator parsing
+            processed_count = result.get('processed', 0)
+            print(f"processed={processed_count}")
+            
+        elif args.score_poi:
+            result = classifier.score_single_poi(args.score_poi)
+            
+            if 'error' in result:
+                logger.error(f"Error scoring POI: {result['error']}")
+                sys.exit(1)
+            
+            print(f"\n🎯 POI Scoring Result:")
+            for key, value in result.items():
+                print(f"  {key}: {value}")
+            
+            print(f"processed=1")
+        
+        else:
+            logger.error("Use --score-city, --city, --score-poi, or --run-mocks")
+            sys.exit(1)
+        
+        sys.exit(0)
     
-    else:
-        print("Use --score-city, --score-poi, or --run-mocks")
+    except Exception as e:
+        logger.error(f"Critical error: {e}")
+        if args.debug:
+            import traceback
+            logger.error(traceback.format_exc())
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

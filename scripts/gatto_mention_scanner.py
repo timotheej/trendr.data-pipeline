@@ -19,6 +19,13 @@ from urllib.parse import urlparse, urljoin
 import xml.etree.ElementTree as ET
 import unicodedata
 
+# Try to import python-dotenv for .env loading
+try:
+    from dotenv import load_dotenv
+    DOTENV_AVAILABLE = True
+except ImportError:
+    DOTENV_AVAILABLE = False
+
 # SERP-only Configuration - Production Settings
 USE_CSE = False
 FETCH_ENABLED = True
@@ -37,19 +44,6 @@ W_TIME_DEFAULTS = {
     'local': 0.50
 }
 
-# Source endpoints mapping (placeholder URLs for Sprint 3)
-SOURCE_ENDPOINTS = {
-    'michelin': [{'kind': 'rss', 'url': 'https://guide.michelin.com/fr/fr/actualites/rss'}],
-    'gault_millau': [{'kind': 'html', 'url': 'https://gaultmillau.com/nouvelles-ouvertures'}],
-    'le_fooding': [{'kind': 'rss', 'url': 'https://lefooding.com/feed'}],
-    'eater': [{'kind': 'rss', 'url': 'https://paris.eater.com/rss'}],
-    'time_out': [{'kind': 'rss', 'url': 'https://timeout.fr/feed'}],
-    'le_figaro': [{'kind': 'rss', 'url': 'https://lefigaro.fr/figaroscope-restaurants/rss'}],
-    'les_echos': [{'kind': 'html', 'url': 'https://lesechos.fr/weekend/echoing-week'}],
-    'conde_nast': [{'kind': 'rss', 'url': 'https://cntraveler.com/restaurants/rss'}],
-    'food_wine': [{'kind': 'html', 'url': 'https://foodandwine.com/best-restaurants-paris'}],
-    'sortiraparis': [{'kind': 'html', 'url': 'https://sortiraparis.com/nouveaux-restaurants'}]
-}
 
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -60,19 +54,6 @@ import config
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Domain mapping for SERP queries
-SOURCE_DOMAINS = {
-    'michelin': 'guide.michelin.com',
-    'gault_millau': 'gaultmillau.com',
-    'le_fooding': 'lefooding.com',
-    'eater': 'eater.com',
-    'time_out': 'timeout.fr',
-    'le_figaro': 'lefigaro.fr',
-    'les_echos': 'lesechos.fr',
-    'conde_nast': 'cntraveler.com',
-    'food_wine': 'foodandwine.com',
-    'sortiraparis': 'sortiraparis.com'
-}
 
 
 def extract_apex_domain(domain: str) -> str:
@@ -161,8 +142,8 @@ class ContentFetcher:
             logger.warning(f"RSS fetch failed for {url}: {e}")
             return []
     
-    def fetch_html_list(self, url: str) -> List[Dict[str, Any]]:
-        """Fetch HTML list using regex heuristics (degraded parser)"""
+    def fetch_html_list(self, url: str, selectors: Dict[str, str] = None) -> List[Dict[str, Any]]:
+        """Fetch HTML list using CSS selectors or regex heuristics as fallback"""
         if not FETCH_ENABLED:
             raise RuntimeError("Network disabled")
             
@@ -173,7 +154,13 @@ class ContentFetcher:
             html = response.text
             articles = []
             
-            # Heuristic: find <a> tags with likely article links
+            if selectors:
+                # Use CSS selectors (requires BeautifulSoup or similar)
+                # For now, implement basic regex-based parsing since BeautifulSoup not available
+                logger.warning(f"CSS selectors not yet implemented, using heuristics for {url}")
+                # TODO: Implement proper CSS selector parsing
+                
+            # Fallback: Heuristic regex parsing
             link_pattern = r'<a[^>]*href=["\']([^"\']+)["\'][^>]*>([^<]+)</a>'
             matches = re.findall(link_pattern, html, re.IGNORECASE)
             
@@ -188,7 +175,8 @@ class ContentFetcher:
                         'published_at': None  # Not available in HTML list mode
                     })
                     
-            logger.warning(f"HTML parsed (degraded mode): {len(articles)} articles from {url}")
+            mode_desc = "selector-based" if selectors else "heuristic"
+            logger.warning(f"HTML parsed ({mode_desc}): {len(articles)} articles from {url}")
             return articles
             
         except Exception as e:
@@ -461,14 +449,14 @@ class CSESearcher:
         self.search_engine_id = search_engine_id
         self.base_url = 'https://www.googleapis.com/customsearch/v1'
         
-    def search(self, query: str, debug: bool = False) -> List[Dict[str, Any]]:
+    def search(self, query: str, debug: bool = False, cse_num: int = 10) -> List[Dict[str, Any]]:
         """Search using Google CSE"""
         try:
             params = {
                 'key': self.api_key,
                 'cx': self.search_engine_id,
                 'q': query,
-                'num': min(10, MAX_URLS_PER_SOURCE),
+                'num': min(cse_num, MAX_URLS_PER_SOURCE),
                 'gl': 'fr',
                 'hl': 'fr'
             }
@@ -478,6 +466,9 @@ class CSESearcher:
             
             response = requests.get(self.base_url, params=params, timeout=10)
             response.raise_for_status()
+            
+            # Rate limiting: wait between each CSE request
+            time.sleep(1.0)  # 1 second delay between requests
             
             data = response.json()
             results = []
@@ -498,10 +489,59 @@ class CSESearcher:
 
 
 def upsert_source_mention(db: SupabaseManager, payload: Dict[str, Any]) -> bool:
-    """Upsert mention with schema tolerance and better logging"""
+    """Upsert mention with 21-day deduplication and detailed logging"""
+    url = payload.get('url', '')
+    poi_id = payload.get('poi_id', '')
+    source_id = payload.get('source_id', '')
+    
+    # Check for existing mention within 21 days
+    cutoff_date = (datetime.now(timezone.utc) - timedelta(days=21)).isoformat()
+    
+    try:
+        existing = db.client.table('source_mention')\
+            .select('id,last_seen_at,published_at')\
+            .eq('url', url)\
+            .eq('poi_id', poi_id)\
+            .gte('last_seen_at', cutoff_date)\
+            .limit(1)\
+            .execute()
+        
+        if existing.data:
+            # Update last_seen_at only
+            mention_id = existing.data[0]['id']
+            update_payload = {
+                'last_seen_at': payload['last_seen_at']
+            }
+            
+            # Preserve published_at if not provided in new payload
+            if not payload.get('published_at') and existing.data[0].get('published_at'):
+                update_payload['published_at'] = existing.data[0]['published_at']
+            elif payload.get('published_at'):
+                update_payload['published_at'] = payload['published_at']
+            
+            result = db.client.table('source_mention')\
+                .update(update_payload)\
+                .eq('id', mention_id)\
+                .execute()
+            
+            logger.info(f"DEDUP: Updated last_seen_at for {source_id}/{urlparse(url).netloc}, "
+                       f"score={payload.get('match_score', 0):.3f}, decision=update_existing")
+            
+            return bool(result.data)
+    
+    except Exception as dedup_error:
+        logger.warning(f"Deduplication check failed: {dedup_error}")
+    
+    # Insert new mention
     try:
         # First try with all fields
         result = db.client.table('source_mention').upsert(payload).execute()
+        
+        logger.info(f"NEW: Inserted mention {source_id}/{urlparse(url).netloc}, "
+                   f"score={payload.get('match_score', 0):.3f}, "
+                   f"title='{payload.get('title', '')[:40]}...', "
+                   f"decision=keep")
+        
         return bool(result.data)
         
     except Exception as full_error:
@@ -518,6 +558,10 @@ def upsert_source_mention(db: SupabaseManager, payload: Dict[str, Any]) -> bool:
                 'match_score': payload.get('match_score', 0)
             }
             
+            # Add published_at if available
+            if payload.get('published_at'):
+                minimal_payload['published_at'] = payload['published_at']
+            
             result = db.client.table('source_mention').upsert(minimal_payload).execute()
             
             # Log ignored fields
@@ -525,72 +569,263 @@ def upsert_source_mention(db: SupabaseManager, payload: Dict[str, Any]) -> bool:
             if ignored_fields:
                 logger.warning(f"Ignored fields (missing columns): {ignored_fields}")
             
+            logger.info(f"NEW: Inserted mention {source_id}/{urlparse(url).netloc}, "
+                       f"score={payload.get('match_score', 0):.3f}, decision=keep")
+            
             return bool(result.data)
             
         except Exception as minimal_error:
             logger.error(f"Minimal upsert also failed: {minimal_error}")
+            logger.info(f"FAILED: Could not insert mention {source_id}/{urlparse(url).netloc}, "
+                       f"score={payload.get('match_score', 0):.3f}, decision=drop")
             return False
 
 
 class GattoMentionScanner:
     """Consolidated mention scanner V2 - Sprint 3 - S3 SERP Fix"""
     
-    def __init__(self, debug: bool = False):
+    def __init__(self, debug: bool = False, allow_no_cse: bool = False):
         self.db = SupabaseManager()
         self.fetcher = ContentFetcher()
         self.matcher = MentionMatcher()
         self.deduplicator = MentionDeduplicator()
         self.debug = debug
+        self._allow_no_cse = allow_no_cse
+        self.config = self._load_config()
         
         # Initialize CSE searcher if USE_CSE is enabled
         self.cse_searcher = None
         if USE_CSE:
-            # Try both possible env var names
-            api_key = os.getenv('GOOGLE_CSE_API_KEY') or os.getenv('GOOGLE_CUSTOM_SEARCH_API_KEY')
-            cx = os.getenv('GOOGLE_CSE_CX') or os.getenv('GOOGLE_CUSTOM_SEARCH_ENGINE_ID')
+            # Try to get CSE config from config.json first, then fall back to env vars
+            api_key = None
+            cx = None
+            
+            # Check if CSE config exists in config.json
+            if 'cse' in self.config:
+                api_key = self.config['cse'].get('api_key')
+                cx = self.config['cse'].get('cx')
+            
+            # If not in config.json, map from environment variables
+            if not api_key or not cx:
+                # Primary env vars
+                api_key = api_key or os.getenv('GOOGLE_CUSTOM_SEARCH_API_KEY')
+                cx = cx or os.getenv('GOOGLE_CUSTOM_SEARCH_ENGINE_ID')
+                
+                # Back-compat env vars  
+                api_key = api_key or os.getenv('GOOGLE_CSE_API_KEY')
+                cx = cx or os.getenv('GOOGLE_CSE_CX')
+            
             if api_key and cx:
                 self.cse_searcher = CSESearcher(api_key, cx)
                 logger.info(f"CSE initialized with API key: {api_key[:20]}... and CX: {cx}")
-            else:
-                logger.error("CSE mode enabled but CSE keys not found in environment")
+            # Note: CSE unavailable message will be shown by _check_cse_availability() when first needed
+    
+    def _check_cse_availability(self, allow_no_cse: bool = False, fail_fast_context: str = None) -> bool:
+        """Check if CSE is available and log error message once if not
         
-    def _load_active_sources(self, for_serp=False) -> Dict[str, Dict[str, Any]]:
-        """Load active sources from source_catalog"""
+        Args:
+            allow_no_cse: If True, gracefully skip when CSE unavailable 
+            fail_fast_context: Context for fail-fast error message
+        
+        Returns:
+            bool: True if CSE available, False otherwise
+            
+        Raises:
+            SystemExit: If CSE unavailable and fail_fast_context provided without allow_no_cse
+        """
+        if not self.cse_searcher:
+            if not hasattr(self, '_cse_unavailable_logged'):
+                error_msg = "CSE unavailable: missing api_key or cx. Checked ENV keys: GOOGLE_CUSTOM_SEARCH_API_KEY / GOOGLE_CUSTOM_SEARCH_ENGINE_ID."
+                logger.error(error_msg)
+                self._cse_unavailable_logged = True
+                
+                # Fail-fast behavior when context provided and not allowing no CSE
+                if fail_fast_context and not allow_no_cse:
+                    logger.error(f"FAIL-FAST: {fail_fast_context} requires CSE but CSE is unavailable")
+                    sys.exit(1)
+            return False
+        return True
+    
+    def _load_config(self) -> Dict[str, Any]:
+        """Load mention_scanner configuration from config.json"""
         try:
-            if for_serp:
-                # For SERP mode, load sources with base_url to extract domains
-                result = self.db.client.table('source_catalog')\
-                    .select('source_id,authority_weight,decay_tau_days,type,base_url')\
-                    .eq('is_active', True)\
-                    .execute()
-            else:
-                result = self.db.client.table('source_catalog')\
-                    .select('source_id,authority_weight,decay_tau_days,type')\
-                    .eq('is_active', True)\
-                    .execute()
+            config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'config.json')
+            with open(config_path, 'r') as f:
+                full_config = json.load(f)
+            
+            # Default config if mention_scanner section missing
+            default_config = {
+                "mode": "balanced",
+                "match_score": {
+                    "high": 0.92,
+                    "mid": 0.85,
+                    "low": 0.78
+                },
+                "limits": {
+                    "poi_limit": 10,
+                    "sources_limit": 8,
+                    "cse_num": 10,
+                    "max_candidates_per_poi": 100
+                },
+                "serp_cost_control": {
+                    "daily_budget_requests": 900,
+                    "rpm_soft": 60,
+                    "rpm_hard": 120,
+                    "backoff": {"base_ms": 400, "max_ms": 5000, "multiplier": 2.0, "jitter_ms": 250}
+                },
+                "dedup": {
+                    "window_days": 21
+                },
+                "name_match": {
+                    "max_levenshtein": 2,
+                    "normalize_diacritics": True,
+                    "allow_arrondissement_tokens": True
+                },
+                "acceptance_rules": {
+                    "title_has_poi_name_boost": 0.10,
+                    "url_has_poi_name_boost": 0.05,
+                    "authority_weight_threshold": 0.65,
+                    "min_distinct_sources": 1
+                },
+                "domain_groups": {
+                    "press": {"weight": 0.70},
+                    "guide": {"weight": 0.85},
+                    "blog": {"weight": 0.60},
+                    "local": {"weight": 0.50},
+                    "reviews": {"weight": 0.45}
+                },
+                "logging": {
+                    "jsonl": False,
+                    "log_drop_reasons": True
+                },
+                "query_strategy": {
+                    "mode": "poi_strict",
+                    "use_generic_topic_queries": False,
+                    "geo_hints": ["Paris", "750", "1er", "2e", "3e", "4e", "5e", "6e", "7e", "8e", "9e", "10e", "11e", "12e", "13e", "14e", "15e", "16e", "17e", "18e", "19e", "20e"],
+                    "category_synonyms": {
+                        "bar": ["bar à cocktails", "cocktail bar", "bar"],
+                        "cafe": ["café", "coffee shop", "coffee"],
+                        "restaurant": ["restaurant", "bistrot", "brasserie"]
+                    },
+                    "templates": [
+                        "site:{domain} \"{poi_name}\"",
+                        "site:{domain} \"{poi_name_normalized}\"",
+                        "site:{domain} \"{poi_name} {geo_hint}\"",
+                        "site:{domain} \"{poi_name}\" {category_synonym}"
+                    ],
+                    "global_templates": [
+                        "\"{poi_name}\" Paris",
+                        "\"{poi_name_normalized}\" Paris"
+                    ],
+                    "max_templates_per_poi": 6
+                }
+            }
+            
+            mention_config = full_config.get('mention_scanner', default_config)
+            return mention_config
+            
+        except Exception as e:
+            logger.warning(f"Could not load config.json: {e}, using defaults")
+            return {
+                "mode": "balanced",
+                "match_score": {"high": 0.92, "mid": 0.85, "low": 0.78},
+                "limits": {"poi_limit": 10, "sources_limit": 8, "cse_num": 10, "max_candidates_per_poi": 100},
+                "serp_cost_control": {"daily_budget_requests": 900, "rpm_soft": 60, "rpm_hard": 120, "backoff": {"base_ms": 400, "max_ms": 5000, "multiplier": 2.0, "jitter_ms": 250}},
+                "dedup": {"window_days": 21},
+                "name_match": {"max_levenshtein": 2, "normalize_diacritics": True, "allow_arrondissement_tokens": True},
+                "acceptance_rules": {"title_has_poi_name_boost": 0.10, "url_has_poi_name_boost": 0.05, "authority_weight_threshold": 0.65, "min_distinct_sources": 1},
+                "domain_groups": {"press": {"weight": 0.70}, "guide": {"weight": 0.85}, "blog": {"weight": 0.60}, "local": {"weight": 0.50}, "reviews": {"weight": 0.45}},
+                "logging": {"jsonl": False, "log_drop_reasons": True}
+            }
+    
+    def _log_config_summary(self):
+        """Log effective configuration at startup"""
+        logger.info(f"📋 Configuration Summary:")
+        logger.info(f"  Mode: {self.config['mode']}")
+        logger.info(f"  Match scores: HIGH={self.config['match_score']['high']}, MID={self.config['match_score']['mid']}, LOW={self.config['match_score']['low']}")
+        logger.info(f"  Limits: POI={self.config['limits']['poi_limit']}, Sources={self.config['limits']['sources_limit']}, CSE_num={self.config['limits']['cse_num']}")
+        logger.info(f"  Dedup window: {self.config['dedup']['window_days']} days")
+        
+    def _load_active_sources(self, for_serp=False, limit: int = None, requested_sources: List[str] = None) -> Dict[str, Dict[str, Any]]:
+        """Load active sources from source_catalog with DB-driven endpoints"""
+        try:
+            # Load all relevant fields from source_catalog (gracefully handle missing columns)
+            query = self.db.client.table('source_catalog')\
+                .select('source_id,authority_weight,decay_tau_days,type,base_url,fetch_method')\
+                .eq('is_active', True)
+                
+            result = query.execute()
+            
+            # Filter for SERP-eligible sources (editorial only)
+            all_sources = result.data or []
+            serp_eligible = []
+            filtered_reasons = []
+            
+            for source in all_sources:
+                source_type = source.get('type', 'unknown')
+                fetch_method = source.get('fetch_method', 'unknown')
+                
+                # Exclude reviews and API sources
+                if source_type == 'reviews':
+                    filtered_reasons.append(f"{source['source_id']}=type:reviews")
+                elif fetch_method == 'api':
+                    filtered_reasons.append(f"{source['source_id']}=fetch_method:api")
+                elif source_type in {'press', 'guide', 'blog', 'local'}:
+                    serp_eligible.append(source)
+                else:
+                    filtered_reasons.append(f"{source['source_id']}=type:{source_type}")
+            
+            logger.info(f"serp_eligible_sources={len(serp_eligible)}, filtered_out={len(filtered_reasons)} (reasons: {', '.join(filtered_reasons[:5])}{'...' if len(filtered_reasons) > 5 else ''})")
+            
+            # Apply strict --sources filtering if requested
+            if requested_sources:
+                requested_set = set(requested_sources)
+                available_sources = {src['source_id'] for src in serp_eligible}
+                excluded_sources = requested_set - available_sources
+                
+                # Log excluded sources
+                for excluded in excluded_sources:
+                    logger.info(f"[SOURCES] '{excluded}' is not active in DB -> excluded")
+                
+                # Filter to only requested sources that are available
+                serp_eligible = [src for src in serp_eligible if src['source_id'] in requested_set]
+                
+                # Fail fast if no sources remain
+                if not serp_eligible:
+                    logger.error(f"[SOURCES] No active sources found from requested: {', '.join(requested_sources)}")
+                    exit(1)
+                
+                # Log summary
+                loaded_sources = [src['source_id'] for src in serp_eligible]
+                logger.info(f"[SOURCES] requested={', '.join(requested_sources)} loaded={', '.join(loaded_sources)} excluded={', '.join(excluded_sources)}")
+            
+            # Apply limit AFTER filtering (including --sources filtering)
+            if limit:
+                serp_eligible = serp_eligible[:limit]
             
             sources = {}
-            for source in result.data or []:
+            for source in serp_eligible:
                 source_id = source['source_id']
-                if for_serp:
-                    # Extract domain from base_url
-                    base_url = source.get('base_url', '')
-                    if base_url:
-                        domain = urlparse(base_url).netloc
-                        apex_domain = extract_apex_domain(domain)
-                        sources[source_id] = {
-                            'authority_weight': source.get('authority_weight', 0.5),
-                            'decay_tau_days': source.get('decay_tau_days', 60),
-                            'type': source.get('type', 'press'),
-                            'domain': apex_domain
-                        }
-                elif source_id in SOURCE_ENDPOINTS:  # RSS/HTML mode
-                    sources[source_id] = {
-                        'authority_weight': source.get('authority_weight', 0.5),
-                        'decay_tau_days': source.get('decay_tau_days', 60),
-                        'type': source.get('type', 'press'),
-                        'endpoints': SOURCE_ENDPOINTS[source_id]
-                    }
+                
+                # Determine CSE domain
+                cse_domain = extract_apex_domain(source.get('base_url', ''))
+                
+                # For now, default to CSE_DOMAIN mode since we don't have the confirmed endpoint columns
+                mode = 'CSE_DOMAIN'
+                endpoint_url = None
+                html_selectors = None
+                is_confirmed = False
+                
+                sources[source_id] = {
+                    'authority_weight': source.get('authority_weight', 0.5),
+                    'decay_tau_days': source.get('decay_tau_days', 60),
+                    'type': source.get('type', 'press'),
+                    'mode': mode,
+                    'endpoint_url': endpoint_url,
+                    'html_selectors': html_selectors,
+                    'cse_domain': cse_domain,
+                    'is_confirmed': is_confirmed
+                }
             
             logger.info(f"Loaded {len(sources)} active sources: {list(sources.keys())}")
             return sources
@@ -599,13 +834,59 @@ class GattoMentionScanner:
             logger.error(f"Error loading sources: {e}")
             return {}
     
-    def _load_pois(self, city_slug: str = 'paris') -> List[Dict[str, Any]]:
+    def _load_pois(self, city_slug: str = 'paris', limit: int = None, poi_name: str = None, poi_id: str = None) -> List[Dict[str, Any]]:
         """Load POIs for matching"""
         try:
-            result = self.db.client.table('poi')\
-                .select('id,name,lat,lng')\
-                .eq('city_slug', city_slug)\
-                .execute()
+            # Normalize city to lowercase
+            city_slug = city_slug.lower()
+            
+            # Handle specific POI filtering (overrides limit)
+            if poi_id:
+                logger.info(f"[FILTER] using poi-id={poi_id}")
+                query = self.db.client.table('poi')\
+                    .select('id,name,lat,lng')\
+                    .eq('city_slug', city_slug)\
+                    .eq('id', poi_id)
+            elif poi_name:
+                logger.info(f"[FILTER] using poi-name={poi_name}")
+                if limit is None:
+                    logger.info("[FILTER] poi-name ordering applied")
+                    # Fetch all matching POIs and apply custom ordering in Python
+                    query = self.db.client.table('poi')\
+                        .select('id,name,lat,lng')\
+                        .eq('city_slug', city_slug)\
+                        .ilike('name', f'%{poi_name}%')
+                    
+                    result = query.execute()
+                    all_pois = result.data or []
+                    
+                    # Apply custom ordering: exact match priority, then name
+                    def sort_key(poi):
+                        name_lower = poi['name'].lower()
+                        poi_name_lower = poi_name.lower()
+                        exact_match = name_lower == poi_name_lower
+                        contains_match = poi_name_lower in name_lower
+                        return (-exact_match, -contains_match, poi['name'])
+                    
+                    sorted_pois = sorted(all_pois, key=sort_key)
+                    pois = sorted_pois[:1]  # LIMIT 1
+                    
+                    logger.info(f"Loaded {len(pois)} POIs for matching")
+                    return pois
+                else:
+                    query = self.db.client.table('poi')\
+                        .select('id,name,lat,lng')\
+                        .eq('city_slug', city_slug)\
+                        .ilike('name', f'%{poi_name}%')\
+                        .limit(limit)
+            else:
+                query = self.db.client.table('poi')\
+                    .select('id,name,lat,lng')\
+                    .eq('city_slug', city_slug)
+                if limit:
+                    query = query.limit(limit)
+                
+            result = query.execute()
             
             pois = result.data or []
             logger.info(f"Loaded {len(pois)} POIs for matching")
@@ -615,30 +896,222 @@ class GattoMentionScanner:
             logger.error(f"Error loading POIs: {e}")
             return []
     
-    def _fetch_articles_for_source(self, source_id: str, source_config: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Fetch articles for a single source"""
+    def _fetch_articles_for_source(self, source_id: str, source_config: Dict[str, Any], serp_only: bool = False) -> List[Dict[str, Any]]:
+        """Fetch articles for a single source using DB-driven endpoints"""
         articles = []
-        endpoints = source_config.get('endpoints', [])
+        mode = source_config.get('mode', 'CSE_DOMAIN')
+        endpoint_url = source_config.get('endpoint_url')
+        is_confirmed = source_config.get('is_confirmed', False)
         
-        for endpoint in endpoints:
-            try:
-                if endpoint['kind'] == 'rss':
-                    batch = self.fetcher.fetch_rss(endpoint['url'])
-                else:  # html
-                    batch = self.fetcher.fetch_html_list(endpoint['url'])
+        # Force CSE_DOMAIN if serp_only mode
+        if serp_only:
+            mode = 'CSE_DOMAIN'
+            reason = 'serp_only_forced'
+        else:
+            reason = 'db_confirmed' if is_confirmed else 'no_confirmed_endpoint'
+        
+        logger.info(f"[SOURCE {source_id}] mode={mode} reason={reason}")
+        
+        try:
+            if mode == 'RSS' and not serp_only:
+                articles = self.fetcher.fetch_rss(endpoint_url)
+                # Fallback to CSE if RSS fails or returns 0 articles
+                if not articles:
+                    logger.info(f"[SOURCE {source_id}] fallback=CSE_DOMAIN (RSS returned 0)")
+                    # For normal mode, use generic CSE queries (no specific POI)
+                    articles = self._fetch_cse_articles(source_id, source_config)
+                    
+            elif mode == 'HTML' and not serp_only:
+                html_selectors = source_config.get('html_selectors')
+                articles = self.fetcher.fetch_html_list(endpoint_url, html_selectors)
+                # Fallback to CSE if HTML fails or returns 0 articles
+                if not articles:
+                    logger.info(f"[SOURCE {source_id}] fallback=CSE_DOMAIN (HTML returned 0)")
+                    # For normal mode, use generic CSE queries (no specific POI)
+                    articles = self._fetch_cse_articles(source_id, source_config)
+                    
+            elif mode == 'CSE_DOMAIN':
+                # CSE_DOMAIN mode requires CSE, use fail-fast unless allow_no_cse is set
+                allow_no_cse = getattr(self, '_allow_no_cse', False)
+                if not self._check_cse_availability(allow_no_cse=allow_no_cse, fail_fast_context=f"Source {source_id} CSE_DOMAIN mode"):
+                    return []
+                articles = self._fetch_cse_articles(source_id, source_config)
                 
-                articles.extend(batch)
-                self.fetcher.rate_limit_sleep()
-                
-            except RuntimeError as e:
-                if "Network disabled" in str(e):
-                    raise  # Re-raise for mocks
-                logger.error(f"Fetch error for {source_id}: {e}")
-            except Exception as e:
-                logger.error(f"Fetch error for {source_id}: {e}")
+            self.fetcher.rate_limit_sleep()
+            
+        except RuntimeError as e:
+            if "Network disabled" in str(e):
+                raise  # Re-raise for mocks
+            logger.warning(f"[SOURCE {source_id}] fetch error: {e}, trying CSE fallback")
+            articles = self._fetch_cse_articles(source_id, source_config)
+        except Exception as e:
+            logger.warning(f"[SOURCE {source_id}] fetch error: {e}, trying CSE fallback")
+            articles = self._fetch_cse_articles(source_id, source_config)
         
         logger.info(f"Fetched {len(articles)} articles for {source_id}")
         return articles[:MAX_URLS_PER_SOURCE]
+    
+    def _normalize_poi_name(self, poi_name: str) -> str:
+        """Normalize POI name by removing diacritics and special characters"""
+        # Remove accents
+        normalized = unicodedata.normalize('NFD', poi_name)
+        normalized = ''.join(c for c in normalized if unicodedata.category(c) != 'Mn')
+        # Remove apostrophes and normalize
+        normalized = normalized.replace("'", " ").replace("'", " ")
+        return normalized.strip()
+    
+    def _get_category_synonyms(self, poi: Dict[str, Any]) -> List[str]:
+        """Get category synonyms for a POI"""
+        poi_types = poi.get('types', [])
+        if isinstance(poi_types, str):
+            poi_types = [poi_types]
+        
+        query_strategy = self.config.get('query_strategy', {})
+        category_synonyms = query_strategy.get('category_synonyms', {})
+        
+        synonyms = []
+        for poi_type in poi_types:
+            if poi_type in category_synonyms:
+                synonyms.extend(category_synonyms[poi_type])
+        
+        # Default fallback
+        if not synonyms:
+            if any(t in ['restaurant', 'food'] for t in poi_types):
+                synonyms = ['restaurant']
+            elif any(t in ['bar'] for t in poi_types):
+                synonyms = ['bar']
+            elif any(t in ['cafe'] for t in poi_types):
+                synonyms = ['café']
+        
+        return synonyms
+    
+    def _generate_poi_queries(self, poi: Dict[str, Any], source_config: Dict[str, Any]) -> List[str]:
+        """Generate POI-centric queries using templates from config"""
+        query_strategy = self.config.get('query_strategy', {})
+        
+        # Check if we should use generic queries (disabled in poi_strict mode)
+        if query_strategy.get('mode') == 'poi_strict' and not query_strategy.get('use_generic_topic_queries', True):
+            # Use template-based queries only
+            return self._generate_template_queries(poi, source_config, query_strategy)
+        
+        # Fallback to generic query (legacy)
+        cse_domain = source_config.get('cse_domain')
+        if cse_domain:
+            return [f'site:{cse_domain} restaurant nouveau ouverture']
+        return []
+    
+    def _generate_template_queries(self, poi: Dict[str, Any], source_config: Dict[str, Any], query_strategy: Dict[str, Any]) -> List[str]:
+        """Generate queries from templates in query_strategy"""
+        poi_name = poi.get('name', '')
+        if not poi_name:
+            return []
+        
+        poi_name_normalized = self._normalize_poi_name(poi_name)
+        cse_domain = source_config.get('cse_domain', '')
+        geo_hints = query_strategy.get('geo_hints', ['Paris'])
+        category_synonyms = self._get_category_synonyms(poi)
+        max_templates = query_strategy.get('max_templates_per_poi', 6)
+        
+        queries = []
+        
+        # Domain-scoped templates (site:{domain})
+        domain_templates = query_strategy.get('templates', [])
+        for template in domain_templates:
+            if len(queries) >= max_templates:
+                break
+                
+            if '{domain}' in template and cse_domain:
+                # Base query with POI name
+                if '{poi_name}' in template and '{geo_hint}' not in template and '{category_synonym}' not in template:
+                    if '{poi_name_normalized}' in template:
+                        query = template.replace('{domain}', cse_domain).replace('{poi_name_normalized}', poi_name_normalized)
+                    else:
+                        query = template.replace('{domain}', cse_domain).replace('{poi_name}', poi_name)
+                    queries.append(query)
+                
+                # Query with geo hint
+                elif '{geo_hint}' in template:
+                    for geo_hint in geo_hints[:2]:  # Limit to 1-2 geo hints per POI
+                        if len(queries) >= max_templates:
+                            break
+                        query = template.replace('{domain}', cse_domain).replace('{poi_name}', poi_name).replace('{geo_hint}', geo_hint)
+                        queries.append(query)
+                
+                # Query with category synonym  
+                elif '{category_synonym}' in template and category_synonyms:
+                    for synonym in category_synonyms[:1]:  # Limit to 1 synonym
+                        if len(queries) >= max_templates:
+                            break
+                        query = template.replace('{domain}', cse_domain).replace('{poi_name}', poi_name).replace('{category_synonym}', synonym)
+                        queries.append(query)
+        
+        # Global templates (no site: filter)
+        global_templates = query_strategy.get('global_templates', [])
+        for template in global_templates:
+            if len(queries) >= max_templates:
+                break
+                
+            if '{poi_name_normalized}' in template:
+                query = template.replace('{poi_name_normalized}', poi_name_normalized)
+            else:
+                query = template.replace('{poi_name}', poi_name)
+            queries.append(query)
+        
+        return queries[:max_templates]
+    
+    def _fetch_cse_articles(self, source_id: str, source_config: Dict[str, Any], poi: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+        """Fetch articles using CSE with POI-centric queries"""
+        if not self._check_cse_availability():
+            return []
+        
+        # Generate POI-centric queries if POI provided
+        if poi:
+            queries = self._generate_poi_queries(poi, source_config)
+            if not queries:
+                logger.warning(f"[SOURCE {source_id}] No queries generated for POI {poi.get('name')}, skipping")
+                return []
+                
+            logger.info(f"[POI {poi.get('id', 'unknown')}] queries_built={len(queries)}, examples=[{queries[0] if queries else 'none'}]")
+        else:
+            # Fallback to generic query
+            cse_domain = source_config.get('cse_domain')
+            if not cse_domain:
+                logger.warning(f"[SOURCE {source_id}] No CSE domain configured, skipping")
+                return []
+            queries = [f'site:{cse_domain} restaurant nouveau ouverture']
+        
+        cse_num = self.config['limits']['cse_num']
+        all_articles = []
+        
+        for query in queries:
+            try:
+                results = self.cse_searcher.search(query, self.debug, cse_num)
+                
+                for item in results:
+                    all_articles.append({
+                        'title': item.get('title', ''),
+                        'url': item.get('link', ''),
+                        'published_at': None,  # CSE doesn't provide dates
+                        'query_used': query
+                    })
+                
+                # Rate limiting between queries
+                if len(queries) > 1:
+                    time.sleep(0.5)
+                    
+            except Exception as e:
+                logger.warning(f"[SOURCE {source_id}] CSE search failed for query '{query}': {e}")
+                continue
+        
+        # Remove duplicates by URL
+        seen_urls = set()
+        unique_articles = []
+        for article in all_articles:
+            if article['url'] not in seen_urls:
+                seen_urls.add(article['url'])
+                unique_articles.append(article)
+        
+        return unique_articles[:MAX_URLS_PER_SOURCE]
     
     def _determine_mention_type(self, source_type: str) -> str:
         """Map source type to mention type"""
@@ -649,17 +1122,40 @@ class GattoMentionScanner:
         else:
             return 'local'
     
-    def scan_mentions(self, city_slug: str = 'paris') -> Dict[str, Any]:
-        """Main scanning method - Sprint 3 consolidation"""
+    def scan_mentions(self, city_slug: str = 'paris', serp_only: bool = False, cse_num: int = 10, 
+                     poi_limit: int = None, sources_limit: int = None, poi_name: str = None, poi_id: str = None, 
+                     source_ids: List[str] = None) -> Dict[str, Any]:
+        """Main scanning method - Sprint 3 consolidation with serp_only support"""
+        # Apply limits from config with CLI overrides
+        # Special case: if poi_name is provided without poi_limit, pass None to enable ordering
+        effective_poi_limit = poi_limit if poi_name and poi_limit is None else (poi_limit or self.config['limits']['poi_limit'])
+        effective_sources_limit = sources_limit or self.config['limits']['sources_limit']
+        
+        if serp_only:
+            logger.info(f"🔍 Starting SERP-only scan for {city_slug} with cse_num={cse_num}")
+            # Load limited POIs and sources for SERP mode
+            pois = self._load_pois(city_slug, effective_poi_limit, poi_name=poi_name, poi_id=poi_id)
+            if not pois:
+                logger.warning("No POIs found for SERP scanning")
+                return {'total_mentions': 0, 'sources_processed': 0}
+            
+            sources = self._load_active_sources(limit=effective_sources_limit, requested_sources=source_ids)
+            if not sources:
+                logger.warning("No active sources found")
+                return {'total_mentions': 0, 'sources_processed': 0}
+            
+            return self._scan_serp_sources(pois, sources, city_slug)
+        
+        # Continue with normal scan mode
         logger.info(f"🔍 Starting Sprint 3 mention scan for {city_slug}")
         
-        # Load active sources and POIs
-        sources = self._load_active_sources()
+        # Load active sources and POIs with limits
+        sources = self._load_active_sources(limit=effective_sources_limit, requested_sources=source_ids)
         if not sources:
             logger.warning("No active sources found")
             return {'total_mentions': 0, 'sources_processed': 0}
         
-        pois = self._load_pois(city_slug)
+        pois = self._load_pois(city_slug, effective_poi_limit, poi_name=poi_name, poi_id=poi_id)
         if not pois:
             logger.warning("No POIs found for matching")
             return {'total_mentions': 0, 'sources_processed': 0}
@@ -675,7 +1171,7 @@ class GattoMentionScanner:
                 logger.info(f"📡 Processing source: {source_id}")
                 
                 # Fetch articles
-                articles = self._fetch_articles_for_source(source_id, source_config)
+                articles = self._fetch_articles_for_source(source_id, source_config, serp_only=False)
                 if not articles:
                     source_stats[source_id] = {'urls': 0, 'candidates': 0, 'accepted': 0, 'time': 0}
                     continue
@@ -760,18 +1256,109 @@ class GattoMentionScanner:
             'source_stats': source_stats
         }
     
+    def _scan_serp_sources(self, pois: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], city_slug: str) -> Dict[str, Any]:
+        """Scan sources using CSE_DOMAIN mode with POI-centric queries"""
+        all_mentions = []
+        source_stats = {source_id: {'urls': 0, 'candidates': 0, 'accepted': 0, 'time': 0} for source_id in sources}
+        
+        # POI-centric approach: iterate over POIs, then sources
+        for poi in pois:
+            for source_id, source_config in sources.items():
+                start_time = time.time()
+                
+                try:
+                    logger.info(f"📡 Processing POI {poi.get('name')} × {source_id} (SERP-only)")
+                    
+                    # Fetch POI-centric articles using CSE
+                    articles = self._fetch_cse_articles(source_id, source_config, poi)
+                    if not articles:
+                        continue
+                    
+                    source_stats[source_id]['urls'] += len(articles)
+                    
+                    # Match articles to this specific POI (more precise)
+                    candidates = 0
+                    accepted = 0
+                    
+                    for article in articles:
+                        candidates += 1
+                        source_stats[source_id]['candidates'] += 1
+                        
+                        # Match against the target POI
+                        match_result = self.matcher.match(poi, article['title'])
+                        if match_result:
+                            # Build mention using config defaults for SERP mode
+                            source_type = source_config.get('type', 'press')
+                            w_time = W_TIME_DEFAULTS.get(source_type, 0.60)
+                            
+                            mention = {
+                                'poi_id': match_result['poi_id'],
+                                'source_id': source_id,
+                                'url': article['url'],
+                                'title': article['title'],
+                                'published_at': article.get('published_at'),
+                                'last_seen_at': datetime.now(timezone.utc).isoformat(),
+                                'match_score': match_result['match_score'],
+                                'w_time': w_time,
+                                'authority_weight_snapshot': source_config['authority_weight'],
+                                'mention_type': self._determine_mention_type(source_type),
+                                'query_used': article.get('query_used')
+                            }
+                            
+                            all_mentions.append(mention)
+                            accepted += 1
+                            source_stats[source_id]['accepted'] += 1
+                    
+                    elapsed = time.time() - start_time
+                    source_stats[source_id]['time'] += round(elapsed, 2)
+                    
+                    if accepted > 0:
+                        logger.info(f"✅ {poi.get('name')} × {source_id}: {accepted}/{candidates} accepted")
+                    
+                except Exception as e:
+                    logger.error(f"Error processing {poi.get('name')} × {source_id}: {e}")
+                    source_stats[source_id].setdefault('error', []).append(str(e))
+        
+        # Deduplicate mentions
+        logger.info(f"📊 Deduplicating {len(all_mentions)} mentions...")
+        deduplicated_mentions = self.deduplicator.filter(all_mentions)
+        
+        # Upsert to database
+        upserted = 0
+        for mention in deduplicated_mentions:
+            if upsert_source_mention(self.db, mention):
+                upserted += 1
+        
+        # Summary
+        total_urls = sum(stats.get('urls', 0) for stats in source_stats.values())
+        total_candidates = sum(stats.get('candidates', 0) for stats in source_stats.values())
+        
+        logger.info(f"🎯 SERP scan completed: {upserted} mentions upserted")
+        logger.info(f"📊 Summary: {total_urls} URLs → {total_candidates} candidates → {len(deduplicated_mentions)} deduplicated → {upserted} upserted")
+        
+        return {
+            'total_mentions': upserted,
+            'sources_processed': len([s for s in source_stats.values() if s.get('urls', 0) > 0]),
+            'total_urls': total_urls,
+            'total_candidates': total_candidates,
+            'deduplicated_count': len(deduplicated_mentions),
+            'source_stats': source_stats
+        }
+    
     def scan_serp_only(self, poi_names: List[str], source_ids: List[str], city_slug: str = 'paris', 
                       limit_per_poi: int = None, threshold_high: float = None, threshold_mid: float = None,
-                      token_required_for_mid: bool = None) -> Dict[str, Any]:
-        """SERP-only scanning with CLI threshold overrides"""
-        if not self.cse_searcher:
-            logger.error("CSE searcher not initialized - check GOOGLE_CSE_API_KEY and GOOGLE_CSE_CX")
+                      token_required_for_mid: bool = None, cse_num: int = 10) -> Dict[str, Any]:
+        """SERP-only scanning with CLI threshold overrides and cse_num limit"""
+        # SERP-only requires CSE, use fail-fast unless allow_no_cse is set
+        allow_no_cse = getattr(self, '_allow_no_cse', False)
+        if not self._check_cse_availability(allow_no_cse=allow_no_cse, fail_fast_context="SERP-only mode"):
             return {}
         
         logger.info(f"🔍 Starting SERP-only scan for {len(poi_names)} POIs")
         
         # Load POIs by names
         pois = []
+        city_slug = city_slug.lower()  # Normalize city to lowercase
         for poi_name in poi_names:
             try:
                 result = self.db.client.table('poi')\
@@ -838,16 +1425,16 @@ class GattoMentionScanner:
                         logger.info(f"LOG[QUERY] {json.dumps({'poi': poi_name, 'source': source_id, 'domain': domain, 'q': query})}")
                     
                     # Search with CSE
-                    results = self.cse_searcher.search(query, self.debug)
+                    results = self.cse_searcher.search(query, self.debug, cse_num)
                     
                     # If no results with quotes, try without quotes
                     if not results and '"' in query:
                         query_no_quotes = f'site:{domain} {variant}'
                         if self.debug:
                             logger.info(f"LOG[QUERY_FALLBACK] {json.dumps({'q': query_no_quotes})}")
-                        results = self.cse_searcher.search(query_no_quotes, self.debug)
+                        results = self.cse_searcher.search(query_no_quotes, self.debug, cse_num)
                     
-                    for item in results:
+                    for item in results[:cse_num]:  # Apply cse_num limit here too
                         poi_stats[poi_name]['candidates'] += 1
                         
                         # Domain whitelist check with subdomain support
@@ -1228,22 +1815,24 @@ def run_mock_tests():
     FETCH_ENABLED = True
 
 
-def check_cse_config():
+def check_cse_config(allow_no_cse: bool = False):
     """Check CSE configuration and exit with clear message if missing"""
-    api_key = os.getenv('GOOGLE_CSE_API_KEY') or os.getenv('GOOGLE_CUSTOM_SEARCH_API_KEY')
-    cx = os.getenv('GOOGLE_CSE_CX') or os.getenv('GOOGLE_CUSTOM_SEARCH_ENGINE_ID')
+    # Primary env vars
+    api_key = os.getenv('GOOGLE_CUSTOM_SEARCH_API_KEY')
+    cx = os.getenv('GOOGLE_CUSTOM_SEARCH_ENGINE_ID')
+    
+    # Back-compat env vars
+    api_key = api_key or os.getenv('GOOGLE_CSE_API_KEY')
+    cx = cx or os.getenv('GOOGLE_CSE_CX')
     
     if not api_key or not cx:
-        print("❌ GOOGLE_CSE_API_KEY or GOOGLE_CSE_CX not configured")
-        print("Configure Google Custom Search Engine:")
-        print("1. Create CSE at https://cse.google.com/cse/")
-        print("2. Set to 'Search the entire web' (important for broad coverage)")
-        print("3. Add preferred domains (guide.michelin.com, timeout.fr, eater.com, lefigaro.fr, lefooding.com)")
-        print("4. Get API key from Google Cloud Console (Enable Custom Search API)")
-        print("5. Set environment variables:")
-        print("   export GOOGLE_CSE_API_KEY='your_api_key'")
-        print("   export GOOGLE_CSE_CX='your_search_engine_id'")
-        exit(1)
+        if allow_no_cse:
+            print("⚠️  CSE unavailable: missing api_key or cx. Checked ENV keys: GOOGLE_CUSTOM_SEARCH_API_KEY / GOOGLE_CUSTOM_SEARCH_ENGINE_ID.")
+            return
+        else:
+            print("❌ CSE unavailable: missing api_key or cx. Checked ENV keys: GOOGLE_CUSTOM_SEARCH_API_KEY / GOOGLE_CUSTOM_SEARCH_ENGINE_ID.")
+            print("FAIL-FAST: SERP-only mode requires CSE but CSE is unavailable")
+            exit(1)
 
 
 def print_serp_summary(poi_stats: Dict[str, Any]):
@@ -1334,6 +1923,16 @@ def print_remediation_tips():
 
 def main():
     """CLI interface for Gatto Mention Scanner V2"""
+    # Load .env file if available
+    if DOTENV_AVAILABLE:
+        try:
+            env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env')
+            if os.path.exists(env_path):
+                load_dotenv(env_path)
+                logging.debug("[ENV] .env loaded")
+        except Exception as e:
+            logging.debug(f"[ENV] Failed to load .env: {e}")
+    
     import argparse
     
     parser = argparse.ArgumentParser(description='Gatto Mention Scanner V2 - Sprint 3 Consolidation - S3 SERP Fix')
@@ -1344,6 +1943,11 @@ def main():
     parser.add_argument('--debug', action='store_true', help='Enable detailed debug logging')
     parser.add_argument('--poi-names', help='Comma-separated POI names to test (e.g. "Septime,Le Chateaubriand")')
     parser.add_argument('--sources', help='Comma-separated source IDs (e.g. "michelin,time_out,eater")')
+    parser.add_argument('--poi-limit', type=int, help='Maximum number of POIs to process')
+    parser.add_argument('--poi-name', type=str, help='Specific POI name to process (overrides --poi-limit)')
+    parser.add_argument('--poi-id', type=str, help='Specific POI ID to process (overrides --poi-limit)')
+    parser.add_argument('--sources-limit', type=int, help='Maximum number of sources to process')
+    parser.add_argument('--max-candidates-per-poi', type=int, help='Maximum candidates per POI')
     parser.add_argument('--limit-per-poi', type=int, help='Limit accepted mentions per POI')
     
     # CLI threshold overrides
@@ -1351,73 +1955,167 @@ def main():
     parser.add_argument('--threshold-mid', type=float, help='Override MATCH_SCORE_MID threshold')
     parser.add_argument('--no-token-required-for-mid', action='store_true', help='Disable token requirement for MID threshold')
     
+    # run_pipeline.py compatibility
+    parser.add_argument('--serp-only', action='store_true', help='Use only SERP API for mentions')
+    parser.add_argument('--cse-num', type=int, default=10, help='Number of CSE results (min=1, max=10)')
+    parser.add_argument('--limit', type=int, help='Maximum number of mentions to process (alias for --limit-per-poi)')
+    parser.add_argument('--allow-no-cse', action='store_true', help='Allow graceful skip when CSE is unavailable (default: fail-fast)')
+    parser.add_argument('--cse-health', action='store_true', help='Check CSE health with lightweight test query and exit')
+    
     args = parser.parse_args()
     
-    # Force CSE mode if --scan-serp-only
+    # Clamp cse_num to valid range
+    args.cse_num = max(1, min(args.cse_num, 10))
+    
+    # Handle limit alias with deprecation warning
+    if args.limit:
+        logger.warning("⚠️  --limit is deprecated, use --poi-limit instead")
+        if not args.poi_limit:
+            args.poi_limit = args.limit
+    
+    # Parse requested sources
+    requested_source_ids = None
+    if args.sources:
+        requested_source_ids = [src.strip() for src in args.sources.split(',') if src.strip()]
+    
+    # CSE health check
+    if args.cse_health:
+        # Check CSE configuration
+        # Primary env vars
+        api_key = os.getenv('GOOGLE_CUSTOM_SEARCH_API_KEY')
+        cx = os.getenv('GOOGLE_CUSTOM_SEARCH_ENGINE_ID')
+        
+        # Back-compat env vars
+        api_key = api_key or os.getenv('GOOGLE_CSE_API_KEY')
+        cx = cx or os.getenv('GOOGLE_CSE_CX')
+        
+        # Check for missing configuration
+        if not api_key:
+            print("CSE: MISSING api_key")
+            exit(1)
+        if not cx:
+            print("CSE: MISSING cx")
+            exit(1)
+            
+        # Perform lightweight CSE test
+        try:
+            import requests
+            params = {
+                'key': api_key,
+                'cx': cx,
+                'q': 'Paris',
+                'num': 1,
+                'gl': 'fr',
+                'hl': 'fr'
+            }
+            response = requests.get('https://www.googleapis.com/customsearch/v1', params=params, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                items_count = len(data.get('items', []))
+                print(f"CSE: OK http=200 items={items_count}")
+                exit(0)
+            else:
+                print(f"CSE: FAIL http={response.status_code}")
+                exit(1)
+                
+        except Exception as e:
+            print(f"CSE: FAIL error={str(e)}")
+            exit(1)
+    
+    # Force CSE mode if --scan-serp-only or --serp-only
     global USE_CSE, FETCH_ENABLED
-    if args.scan_serp_only:
+    if args.scan_serp_only or args.serp_only:
         USE_CSE = True
         FETCH_ENABLED = False
     
     # Check CSE config at startup when USE_CSE is True
-    if USE_CSE or args.scan_serp_only:
-        check_cse_config()
+    if USE_CSE or args.scan_serp_only or args.serp_only:
+        check_cse_config(allow_no_cse=args.allow_no_cse)
     
     if args.run_mocks:
         run_mock_tests()
-    elif args.scan_serp_only:
-        if not args.poi_names:
-            print("❌ --poi-names required for SERP-only mode")
-            print("Example: --poi-names 'Septime,Le Chateaubriand,Le Comptoir du Relais'")
-            exit(1)
+        return 0
+    elif args.scan_serp_only or args.serp_only:
+        # Handle both --serp-only (from run_pipeline.py) and --scan-serp-only (legacy)
+        scanner = GattoMentionScanner(debug=args.debug, allow_no_cse=args.allow_no_cse)
+        scanner._log_config_summary()
         
-        poi_names = [name.strip() for name in args.poi_names.split(',')]
-        source_ids = [src.strip() for src in args.sources.split(',')] if args.sources else ['michelin', 'time_out', 'eater', 'le_figaro', 'le_fooding']
-        
-        # Prepare CLI overrides
-        token_required_for_mid = False if args.no_token_required_for_mid else None
-        
-        scanner = GattoMentionScanner(debug=args.debug)
-        results = scanner.scan_serp_only(poi_names, source_ids, args.city_slug, args.limit_per_poi, 
-                                        args.threshold_high, args.threshold_mid, token_required_for_mid)
+        if args.poi_names:
+            # Explicit POI names provided
+            poi_names = [name.strip() for name in args.poi_names.split(',')]
+            source_ids = [src.strip() for src in args.sources.split(',')] if args.sources else ['michelin', 'time_out', 'eater', 'le_figaro', 'le_fooding']
+            
+            # Prepare CLI overrides
+            token_required_for_mid = False if args.no_token_required_for_mid else None
+            
+            results = scanner.scan_serp_only(poi_names, source_ids, args.city_slug, args.limit_per_poi, 
+                                            args.threshold_high, args.threshold_mid, token_required_for_mid, args.cse_num)
+        else:
+            # Use integrated SERP-only mode with auto POI selection  
+            results = scanner.scan_mentions(args.city_slug, serp_only=True, cse_num=args.cse_num, 
+                                          poi_limit=args.poi_limit, sources_limit=args.sources_limit,
+                                          poi_name=args.poi_name, poi_id=args.poi_id, source_ids=requested_source_ids)
+            poi_names = []  # Initialize empty for later use
         
         if results:
-            print_serp_summary(results.get('poi_stats', {}))
+            if hasattr(results, 'get') and results.get('poi_stats'):
+                print_serp_summary(results.get('poi_stats', {}))
             
             # Database verification
             pois = []
-            for poi_name in poi_names:
-                try:
-                    result = scanner.db.client.table('poi')\
-                        .select('id,name')\
-                        .eq('city_slug', args.city_slug)\
-                        .ilike('name', f'%{poi_name}%')\
-                        .limit(1)\
-                        .execute()
-                    if result.data:
-                        pois.append(result.data[0])
-                except:
-                    pass
-            
-            db_verification_check(pois)
+            if poi_names:  # Only if poi_names is defined
+                for poi_name in poi_names:
+                    try:
+                        result = scanner.db.client.table('poi')\
+                            .select('id,name')\
+                            .eq('city_slug', args.city_slug.lower())\
+                            .ilike('name', f'%{poi_name}%')\
+                            .limit(1)\
+                            .execute()
+                        if result.data:
+                            pois.append(result.data[0])
+                    except:
+                        pass
+                
+                db_verification_check(pois)
+            else:
+                print("\n===== DATABASE VERIFICATION ===== ")
+                print("No specific POIs to verify (auto mode)")
             
             # Show remediation tips if no mentions
             if results.get('total_mentions', 0) == 0:
                 print_remediation_tips()
+            return 0
         else:
             print("❌ SERP scan failed")
+            return 1
     elif args.scan:
-        scanner = GattoMentionScanner(debug=args.debug)
-        results = scanner.scan_mentions(args.city_slug)
+        scanner = GattoMentionScanner(debug=args.debug, allow_no_cse=args.allow_no_cse)
+        scanner._log_config_summary()
+        results = scanner.scan_mentions(args.city_slug, poi_limit=args.poi_limit, sources_limit=args.sources_limit,
+                                       poi_name=args.poi_name, poi_id=args.poi_id, source_ids=requested_source_ids)
         print(f"\n🎯 Scan Results:")
         print(f"  • Total mentions: {results['total_mentions']}")
         print(f"  • Sources processed: {results['sources_processed']}")
         print(f"  • URLs scanned: {results.get('total_urls', 0)}")
         print(f"  • Candidates: {results.get('total_candidates', 0)}")
         print(f"  • Deduplicated: {results.get('deduplicated_count', 0)}")
+        return 0
     else:
-        print("🎯 Use --scan to run mention scanning, --scan-serp-only for CSE testing, or --run-mocks for testing")
+        # Default behavior: run normal scan
+        scanner = GattoMentionScanner(debug=args.debug, allow_no_cse=args.allow_no_cse)
+        scanner._log_config_summary()
+        results = scanner.scan_mentions(args.city_slug, poi_limit=args.poi_limit, sources_limit=args.sources_limit,
+                                       poi_name=args.poi_name, poi_id=args.poi_id, source_ids=requested_source_ids)
+        print(f"\n🎯 Scan Results:")
+        print(f"  • Total mentions: {results['total_mentions']}")
+        print(f"  • Sources processed: {results['sources_processed']}")
+        print(f"  • URLs scanned: {results.get('total_urls', 0)}")
+        print(f"  • Candidates: {results.get('total_candidates', 0)}")
+        print(f"  • Deduplicated: {results.get('deduplicated_count', 0)}")
+        return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

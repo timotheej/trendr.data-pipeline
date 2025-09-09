@@ -39,6 +39,78 @@
     "authority_threshold": 0.3,
     "min_proof_sources": 1
   },
+
+  "mention_scanner": {
+    "mode": "balanced",
+    "match_score": {
+      "high": 0.92,
+      "mid": 0.85,
+      "low": 0.78
+    },
+    "limits": {
+      "poi_limit": 10,
+      "sources_limit": 8,
+      "cse_num": 10,
+      "max_candidates_per_poi": 100
+    },
+    "serp_cost_control": {
+      "daily_budget_requests": 900,
+      "rpm_soft": 60,
+      "rpm_hard": 120,
+      "backoff": {
+        "base_ms": 400,
+        "max_ms": 5000,
+        "multiplier": 2.0,
+        "jitter_ms": 250
+      }
+    },
+    "dedup": {
+      "window_days": 21
+    },
+    "name_match": {
+      "max_levenshtein": 2,
+      "normalize_diacritics": true,
+      "allow_arrondissement_tokens": true
+    },
+    "acceptance_rules": {
+      "title_has_poi_name_boost": 0.10,
+      "url_has_poi_name_boost": 0.05,
+      "authority_weight_threshold": 0.65,
+      "min_distinct_sources": 1
+    },
+    "domain_groups": {
+      "press": { "weight": 0.70 },
+      "guide": { "weight": 0.85 },
+      "blog": { "weight": 0.60 },
+      "local": { "weight": 0.50 },
+      "reviews": { "weight": 0.45 }
+    },
+    "logging": {
+      "jsonl": false,
+      "log_drop_reasons": true
+    },
+    "query_strategy": {
+      "mode": "poi_strict",
+      "use_generic_topic_queries": false,
+      "geo_hints": ["Paris", "750", "1er", "2e", "3e", "4e", "5e", "6e", "7e", "8e", "9e", "10e", "11e", "12e", "13e", "14e", "15e", "16e", "17e", "18e", "19e", "20e"],
+      "category_synonyms": {
+        "bar": ["bar à cocktails", "cocktail bar", "bar"],
+        "cafe": ["café", "coffee shop", "coffee"],
+        "restaurant": ["restaurant", "bistrot", "brasserie"]
+      },
+      "templates": [
+        "site:{domain} \"{poi_name}\"",
+        "site:{domain} \"{poi_name_normalized}\"",
+        "site:{domain} \"{poi_name} {geo_hint}\"",
+        "site:{domain} \"{poi_name}\" {category_synonym}"
+      ],
+      "global_templates": [
+        "\"{poi_name}\" Paris",
+        "\"{poi_name_normalized}\" Paris"
+      ],
+      "max_templates_per_poi": 6
+    }
+  },
   
   "api_cost_optimization": {
     "use_basic_fields_only": true,
