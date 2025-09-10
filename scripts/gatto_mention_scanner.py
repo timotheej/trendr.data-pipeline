@@ -18,6 +18,8 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, urljoin
 import xml.etree.ElementTree as ET
 import unicodedata
+import random
+from difflib import SequenceMatcher
 
 # Try to import python-dotenv for .env loading
 try:
@@ -26,8 +28,9 @@ try:
 except ImportError:
     DOTENV_AVAILABLE = False
 
-# SERP-only Configuration - Production Settings
-USE_CSE = False
+
+# SERP-only Configuration - Production Settings  
+USE_CSE = True
 FETCH_ENABLED = True
 MAX_URLS_PER_SOURCE = 12
 MATCH_SCORE_HIGH = 0.85                  # Production threshold
@@ -44,12 +47,39 @@ W_TIME_DEFAULTS = {
     'local': 0.50
 }
 
+# Strategy-based scanning configuration
+# PRIORITY_DOMAINS will be dynamically derived from source_catalog
+
+# Authority scoring for unknown domains
+AUTHORITY_BASE = 0.15  # Long-tail prior
+
+# TLD authority adjustments
+TLD_ADJUSTMENTS = {
+    '.fr': 0.03,
+    '.com': 0.0,
+    '.org': -0.02,
+    'blogspot': -0.05,
+    'wordpress': -0.05
+}
+
+# Social domain penalties
+SOCIAL_DOMAINS = {
+    'facebook.com', 'twitter.com', 'instagram.com', 'linkedin.com',
+    'youtube.com', 'tiktok.com', 'pinterest.com'
+}
+
 
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.database import SupabaseManager
+from utils.api_usage import get_caps, inc_api_usage
 import config
+
+# Environment defaults
+CSE_DAILY_CAP = int(os.getenv("CSE_DAILY_CAP", "1000"))
+HARD_STOP_ON_CAP = os.getenv("HARD_STOP_ON_CAP", "true").lower() == "true"
+CSE_QPM = int(os.getenv("CSE_QPM", "60"))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -76,6 +106,59 @@ def extract_apex_domain(domain: str) -> str:
         return '.'.join(parts[-2:])
     
     return domain
+
+
+def domain_of(url: str = None, displayLink: str = None, formattedUrl: str = None) -> str:
+    """
+    Return a lowercased registrable domain without 'www.'.
+    Strategy:
+      - Try to parse `url`: if scheme missing, prefix 'http://' then urlparse(url).netloc
+      - If still empty, use displayLink (strip port/path).
+      - If still empty, regex on formattedUrl/htmlFormattedUrl: r'^(?:https?://)?([^/]+)'
+      - Lowercase, strip leading 'www.'
+      - Return "" only if all sources missing.
+    """
+    # Try primary URL first
+    if url:
+        try:
+            if not url.startswith(('http://', 'https://')):
+                url = 'http://' + url
+            netloc = urlparse(url).netloc
+            if netloc:
+                domain = netloc.lower()
+                if domain.startswith('www.'):
+                    domain = domain[4:]
+                return domain
+        except Exception:
+            pass
+    
+    # Try displayLink
+    if displayLink:
+        try:
+            domain = displayLink.lower()
+            # Strip port and path
+            domain = domain.split(':')[0].split('/')[0]
+            if domain.startswith('www.'):
+                domain = domain[4:]
+            if domain:
+                return domain
+        except Exception:
+            pass
+    
+    # Try formattedUrl with regex
+    if formattedUrl:
+        try:
+            match = re.match(r'^(?:https?://)?([^/]+)', formattedUrl)
+            if match:
+                domain = match.group(1).lower()
+                if domain.startswith('www.'):
+                    domain = domain[4:]
+                return domain
+        except Exception:
+            pass
+    
+    return ""
+
 
 
 def is_subdomain_match(candidate_domain: str, apex_domain: str) -> bool:
@@ -441,51 +524,297 @@ def generate_name_variants(name: str) -> List[str]:
     return unique_variants
 
 
+# New data helper functions for strategy-based scanning
+def normalize(text: str) -> str:
+    """Normalize text: lowercase, strip accents/punct, collapse spaces"""
+    if not text:
+        return ""
+    # Remove accents
+    text = unicodedata.normalize('NFD', text)
+    text = ''.join(c for c in text if unicodedata.category(c) != 'Mn')
+    # Remove punctuation and normalize spaces
+    text = re.sub(r'[^\w\s]', ' ', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.lower().strip()
+
+
+
+
+def fuzzy_score(a: str, b: str) -> float:
+    """Calculate fuzzy similarity ratio in [0,1]"""
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, normalize(a), normalize(b)).ratio()
+
+
+def geo_hint(title: str, snippet: str, url: str) -> float:
+    """Return 0..1 score based on presence of Paris/France geo indicators"""
+    text = f"{title} {snippet} {url}".lower()
+    score = 0.0
+    
+    # Paris indicators
+    if 'paris' in text:
+        score += 0.4
+    
+    # Arrondissement indicators 
+    if re.search(r'\b(1er|2e|3e|4e|5e|6e|7e|8e|9e|10e|11e|12e|13e|14e|15e|16e|17e|18e|19e|20e)\b', text):
+        score += 0.3
+    elif re.search(r'\barrondissement\b', text):
+        score += 0.2
+    
+    # Postal codes
+    if re.search(r'\b750\d{2}\b', text):
+        score += 0.3
+    
+    # France indicators
+    if re.search(r'\bfrance\b|\bfr\b', text):
+        score += 0.1
+    
+    return min(score, 1.0)
+
+
+def cat_hint(title: str, snippet: str, category: str) -> float:
+    """Lightweight category keyword matching"""
+    text = f"{title} {snippet}".lower()
+    
+    # Category-specific keywords
+    category_keywords = {
+        'restaurant': ['restaurant', 'cuisine', 'chef', 'menu', 'plat', 'gastronomie', 'table'],
+        'bar': ['bar', 'cocktail', 'drink', 'alcool', 'bière', 'vin', 'spiritueux'],
+        'cafe': ['café', 'coffee', 'expresso', 'cappuccino', 'thé', 'petit déjeuner'],
+        'bakery': ['boulangerie', 'pain', 'croissant', 'pâtisserie', 'viennoiserie'],
+        'night_club': ['club', 'dj', 'musique', 'soirée', 'danse', 'nightlife']
+    }
+    
+    keywords = category_keywords.get(category, [])
+    matches = sum(1 for keyword in keywords if keyword in text)
+    
+    return min(matches / max(len(keywords), 1), 1.0)
+
+
+def load_source_catalog(db: SupabaseManager) -> Dict[str, Tuple[str, float, str]]:
+    """Load source catalog into dict {domain -> (source_id, authority_weight, type)}"""
+    try:
+        result = db.client.table('source_catalog')\
+            .select('source_id,authority_weight,type,base_url')\
+            .eq('is_active', True)\
+            .execute()
+        
+        catalog = {}
+        for source in result.data:
+            base_url = source.get('base_url', '')
+            if base_url:
+                domain = domain_of(base_url)
+                if domain:
+                    catalog[domain] = (
+                        source['source_id'], 
+                        source['authority_weight'], 
+                        source['type']
+                    )
+        
+        return catalog
+    except Exception as e:
+        logger.warning(f"Failed to load source catalog: {e}")
+        return {}
+
+
+
+
+def calculate_authority(domain: str, source_catalog: Dict[str, Tuple[str, float, str]]) -> float:
+    """Calculate authority score for a domain"""
+    # Check if domain is in catalog
+    if domain in source_catalog:
+        return source_catalog[domain][1]  # Return authority_weight from catalog
+    
+    # Unknown domain - calculate based on heuristics
+    authority = AUTHORITY_BASE
+    
+    # Social domain penalty
+    if domain in SOCIAL_DOMAINS:
+        authority -= 0.10
+    
+    # TLD adjustments
+    for pattern, adjustment in TLD_ADJUSTMENTS.items():
+        if pattern.startswith('.') and domain.endswith(pattern):
+            authority += adjustment
+            break
+        elif pattern in domain:
+            authority += adjustment
+            break
+    
+    return max(0.0, min(1.0, authority))
+
+
+def calculate_penalties(domain: str, url: str) -> float:
+    """Calculate penalty score for domain/URL patterns"""
+    penalties = 0.0
+    
+    # Social media penalty
+    if domain in SOCIAL_DOMAINS:
+        penalties += 0.15
+    
+    # Low-quality domain patterns
+    if any(pattern in domain for pattern in ['blogspot', 'wordpress', 'wix', 'squarespace']):
+        penalties += 0.10
+    
+    # Suspicious URL patterns
+    if any(pattern in url.lower() for pattern in ['?', '&', '=', '%']):
+        penalties += 0.05
+    
+    return penalties
+
+
+def calculate_score(poi_name: str, title: str, snippet: str, url: str, 
+                   poi_category: str, authority: float) -> float:
+    """Calculate overall score using the specified formula"""
+    domain = domain_of(url)
+    
+    # Calculate components
+    name_match = fuzzy_score(poi_name, title + " " + snippet)
+    geo_score = geo_hint(title, snippet, url)
+    cat_score = cat_hint(title, snippet, poi_category)
+    penalties = calculate_penalties(domain, url)
+    
+    # Apply formula for OPEN phase: s = clamp(0.55*name_match + 0.25*geo_hint + 0.05*cat_hint + 0.15*authority - penalties, 0, 1)
+    score = (0.55 * name_match + 
+             0.25 * geo_score + 
+             0.05 * cat_score + 
+             0.15 * authority - 
+             penalties)
+    
+    return max(0.0, min(1.0, score))
+
+
+def is_acceptable(score: float, geo_score: float) -> bool:
+    """Check if candidate meets acceptance criteria"""
+    return score >= 0.82 and geo_score >= 0.33
+
+
+def is_better_candidate(candidate1: Dict[str, Any], candidate2: Dict[str, Any]) -> bool:
+    """Compare two candidates using stable tie-breaker rules"""
+    score1 = candidate1['score']
+    score2 = candidate2['score']
+    
+    # If score difference is significant (>= 0.01), use score
+    if abs(score1 - score2) >= 0.01:
+        return score1 > score2
+    
+    # Scores are close, use tie-breaker: (-score, -authority_weight, domain lexicographic)
+    auth1 = candidate1['authority_weight']
+    auth2 = candidate2['authority_weight']
+    
+    if abs(auth1 - auth2) >= 0.01:
+        return auth1 > auth2
+    
+    # Both score and authority are close, use domain lexicographic order
+    domain1 = candidate1['domain']
+    domain2 = candidate2['domain']
+    return domain1 < domain2  # Lexicographically smaller domain wins
+
+
 class CSESearcher:
-    """Google Custom Search Engine searcher"""
+    """Enhanced Google Custom Search Engine searcher with rate limiting, retry, and caching"""
     
     def __init__(self, api_key: str, search_engine_id: str):
         self.api_key = api_key
         self.search_engine_id = search_engine_id
         self.base_url = 'https://www.googleapis.com/customsearch/v1'
+        self.api_cache = {}  # Simple in-memory cache
+        self.last_request_time = 0
+        self.error_429_count = 0
         
+    def _get_cache_key(self, query: str, num: int) -> str:
+        """Generate cache key for query"""
+        return f"{query}:{num}"
+    
+    def _rate_limit_delay(self):
+        """Implement rate limiting: 1 req/s avg with jitter"""
+        now = time.time()
+        time_since_last = now - self.last_request_time
+        min_interval = 1.0  # 1 second base interval for CSE_QPM=60
+        
+        if time_since_last < min_interval:
+            sleep_time = min_interval - time_since_last
+            # Add jitter (100-300ms)
+            jitter = random.uniform(0.1, 0.3)
+            time.sleep(sleep_time + jitter)
+        
+        self.last_request_time = time.time()
+    
+    def _retry_request(self, params: dict, max_retries: int = 5) -> Optional[dict]:
+        """Make request with exponential backoff on 429/5xx errors"""
+        backoff_delays = [0.25, 0.5, 1.0, 2.0, 4.0]
+        
+        for attempt in range(max_retries):
+            try:
+                self._rate_limit_delay()
+                response = requests.get(self.base_url, params=params, timeout=10)
+                
+                if response.status_code == 200:
+                    return response.json()
+                elif response.status_code == 429:
+                    self.error_429_count += 1
+                    retry_after = int(response.headers.get('Retry-After', backoff_delays[min(attempt, len(backoff_delays)-1)]))
+                    logger.warning(f"Rate limited (429), retry after {retry_after}s (attempt {attempt+1}/{max_retries})")
+                    time.sleep(retry_after)
+                elif response.status_code >= 500:
+                    delay = backoff_delays[min(attempt, len(backoff_delays)-1)]
+                    logger.warning(f"Server error {response.status_code}, retrying in {delay}s (attempt {attempt+1}/{max_retries})")
+                    time.sleep(delay)
+                else:
+                    logger.error(f"CSE request failed with status {response.status_code}: {response.text}")
+                    break
+                    
+            except requests.exceptions.Timeout:
+                delay = backoff_delays[min(attempt, len(backoff_delays)-1)]
+                logger.warning(f"Request timeout, retrying in {delay}s (attempt {attempt+1}/{max_retries})")
+                time.sleep(delay)
+            except Exception as e:
+                logger.error(f"Request failed: {e}")
+                break
+        
+        return None
+    
     def search(self, query: str, debug: bool = False, cse_num: int = 10) -> List[Dict[str, Any]]:
-        """Search using Google CSE"""
-        try:
-            params = {
-                'key': self.api_key,
-                'cx': self.search_engine_id,
-                'q': query,
-                'num': min(cse_num, MAX_URLS_PER_SOURCE),
-                'gl': 'fr',
-                'hl': 'fr'
-            }
-            
-            if debug:
-                logger.info(f"LOG[QUERY] {json.dumps({'q': query})}")
-            
-            response = requests.get(self.base_url, params=params, timeout=10)
-            response.raise_for_status()
-            
-            # Rate limiting: wait between each CSE request
-            time.sleep(1.0)  # 1 second delay between requests
-            
-            data = response.json()
-            results = []
-            
-            for item in data.get('items', []):
-                results.append({
-                    'title': item.get('title', ''),
-                    'link': item.get('link', ''),
-                    'displayLink': item.get('displayLink', ''),
-                    'snippet': item.get('snippet', '')
-                })
-            
-            return results
-            
-        except Exception as e:
-            logger.warning(f"CSE search failed for query '{query}': {e}")
+        """Search using Google CSE with caching and retry logic"""
+        # Check cache first (TTL 86400 = 24h)
+        cache_key = self._get_cache_key(query, cse_num)
+        if cache_key in self.api_cache:
+            cached_data, cached_time = self.api_cache[cache_key]
+            if time.time() - cached_time < 86400:  # 24h TTL
+                if debug:
+                    logger.info(f"LOG[QUERY_CACHED] {json.dumps({'q': query})}")
+                return cached_data
+        
+        params = {
+            'key': self.api_key,
+            'cx': self.search_engine_id,
+            'q': query,
+            'num': min(cse_num, 10),  # CSE max is 10
+            'gl': 'fr',
+            'hl': 'fr'
+        }
+        
+        if debug:
+            logger.info(f"LOG[QUERY] {json.dumps({'q': query})}")
+        
+        data = self._retry_request(params)
+        if not data:
             return []
+        
+        results = []
+        for item in data.get('items', []):
+            results.append({
+                'title': item.get('title', ''),
+                'link': item.get('link', ''),
+                'displayLink': item.get('displayLink', ''),
+                'snippet': item.get('snippet', '')
+            })
+        
+        # Cache the results
+        self.api_cache[cache_key] = (results, time.time())
+        
+        return results
 
 
 def upsert_source_mention(db: SupabaseManager, payload: Dict[str, Any]) -> bool:
@@ -592,6 +921,27 @@ class GattoMentionScanner:
         self.debug = debug
         self._allow_no_cse = allow_no_cse
         self.config = self._load_config()
+        
+        # Metrics tracking
+        self.pois_loaded = 0
+        self.pois_processed = 0
+        self.pois_with_candidates = 0
+        self.pois_with_accepts = 0
+        self.stopped_reason = "ok"
+        
+        # Daily cap tracking
+        self.used_today = 0
+        self.daily_cap = CSE_DAILY_CAP
+        self.usage_persisted = False
+        self.api_usage_disabled = False  # Flag to disable DB attempts after first failure
+        self.samples = []
+        self.top_score_last_poi = None  # Track top score from last POI for diagnostics
+        
+        # Initialize daily cap usage
+        self._initialize_daily_cap()
+        
+        # Load priority domains from DB
+        self._load_priority_domains()
         
         # Initialize CSE searcher if USE_CSE is enabled
         self.cse_searcher = None
@@ -737,6 +1087,92 @@ class GattoMentionScanner:
                 "domain_groups": {"press": {"weight": 0.70}, "guide": {"weight": 0.85}, "blog": {"weight": 0.60}, "local": {"weight": 0.50}, "reviews": {"weight": 0.45}},
                 "logging": {"jsonl": False, "log_drop_reasons": True}
             }
+    
+    def _initialize_daily_cap(self):
+        """Initialize daily cap tracking by reading current usage from DB"""
+        supabase_url = os.getenv('SUPABASE_URL')
+        supabase_key = os.getenv('SUPABASE_ANON_KEY')
+        
+        if not supabase_url or not supabase_key:
+            logger.warning("api_usage disabled for this run (fallback to memory): missing credentials")
+            self.api_usage_disabled = True
+            return
+            
+        try:
+            self.used_today, self.daily_cap, self.usage_persisted = inc_api_usage(
+                supabase_url, supabase_key, inc=0, daily_limit=CSE_DAILY_CAP
+            )
+            if self.debug:
+                logger.info(f"Daily cap initialized: {self.used_today}/{self.daily_cap}, persisted={self.usage_persisted}")
+        except Exception as e:
+            logger.warning(f"api_usage disabled for this run (fallback to memory): {e}")
+            self.api_usage_disabled = True
+    
+    def _load_priority_domains(self):
+        """Load priority domains from source_catalog for fallback queries"""
+        try:
+            result = self.db.client.table('source_catalog')\
+                .select('source_id,authority_weight,type,base_url,cse_site_override')\
+                .eq('is_active', True)\
+                .in_('type', ['guide', 'press', 'local'])\
+                .order('authority_weight', desc=True)\
+                .limit(16)\
+                .execute()
+            
+            # Dedupe by domain and keep top 6-8 by authority_weight
+            priority_domains = []
+            seen_domains = set()
+            
+            for row in result.data:
+                domain = row.get('cse_site_override') or row.get('base_url', '')
+                if domain and domain not in seen_domains:
+                    priority_domains.append(domain)
+                    seen_domains.add(domain)
+                    if len(priority_domains) >= 8:
+                        break
+            
+            self.priority_domains = priority_domains
+            if self.debug:
+                logger.info(f"Loaded {len(self.priority_domains)} priority domains")
+                
+        except Exception as e:
+            logger.warning(f"Could not load priority domains from DB: {e}, using fallback")
+            # Fallback to empty list - will be handled gracefully
+            self.priority_domains = []
+    
+    def _check_daily_cap_gate(self) -> bool:
+        """Check if we can make another CSE call without hitting daily cap
+        Returns True if we can proceed, False if we should stop
+        """
+        remaining = self.daily_cap - self.used_today
+        
+        if remaining < 1:
+            if HARD_STOP_ON_CAP:
+                self.stopped_reason = "daily_cap_reached"
+                logger.warning(f"Daily cap reached ({self.used_today}/{self.daily_cap}), stopping due to HARD_STOP_ON_CAP")
+                return False
+            else:
+                logger.warning(f"Daily cap exceeded ({self.used_today}/{self.daily_cap}), continuing anyway")
+        
+        return True
+    
+    def _record_api_usage(self):
+        """Record one API usage in tracking"""
+        if self.api_usage_disabled:
+            self.used_today += 1
+            return
+            
+        try:
+            supabase_url = os.getenv('SUPABASE_URL')
+            supabase_key = os.getenv('SUPABASE_ANON_KEY')
+            self.used_today, self.daily_cap, self.usage_persisted = inc_api_usage(
+                supabase_url, supabase_key, inc=1, daily_limit=CSE_DAILY_CAP
+            )
+        except Exception as e:
+            logger.warning(f"api_usage disabled for this run (fallback to memory): {e}")
+            self.api_usage_disabled = True
+            self.usage_persisted = False
+            self.used_today += 1
     
     def _log_config_summary(self):
         """Log effective configuration at startup"""
@@ -1122,10 +1558,631 @@ class GattoMentionScanner:
         else:
             return 'local'
     
+    # New strategy-based scanning methods
+    def scan_strategy_based(self, city_slug: str, strategy: str, poi_cse_budget: int, 
+                           run_cse_cap: int, poi_limit: int = None) -> Dict[str, Any]:
+        """Main entry point for strategy-based scanning"""
+        start_time = time.time()
+        
+        # Initialize tracking variables
+        self.cse_calls_made = 0
+        self.cse_429_errors = 0
+        self.source_catalog = load_source_catalog(self.db)
+        # Priority domains loaded in _load_priority_domains()
+        
+        if self.debug:
+            logger.info(f"Derived {len(self.priority_domains)} priority domains: {self.priority_domains}")
+        
+        # Load POIs
+        pois = self._load_pois_for_scanning(city_slug, poi_limit)
+        self.pois_loaded = len(pois) if pois else 0
+        if not pois:
+            return self._create_final_summary(strategy, [], start_time)
+        
+        # Check CSE availability
+        if not self._check_cse_availability(allow_no_cse=False):
+            logger.error("CSE unavailable - cannot proceed with strategy-based scanning")
+            return self._create_final_summary(strategy, [], start_time)
+        
+        # Process POIs based on strategy
+        if strategy == 'open':
+            results = self._scan_open_strategy(pois, poi_cse_budget, run_cse_cap)
+        elif strategy == 'whitelist':
+            results = self._scan_whitelist_strategy(pois, poi_cse_budget, run_cse_cap)
+        else:  # hybrid
+            results = self._scan_hybrid_strategy(pois, poi_cse_budget, run_cse_cap)
+        
+        return self._create_final_summary(strategy, results, start_time)
+    
+    def _load_pois_for_scanning(self, city_slug: str, limit: int = None) -> List[Dict[str, Any]]:
+        """Load POIs for scanning"""
+        try:
+            query = self.db.client.table('poi')\
+                .select('id,name,lat,lng,category')\
+                .eq('city_slug', city_slug)
+            
+            if limit:
+                query = query.limit(limit)
+                
+            result = query.execute()
+            return result.data
+        except Exception as e:
+            logger.error(f"Failed to load POIs: {e}")
+            return []
+    
+    def _scan_open_strategy(self, pois: List[Dict[str, Any]], poi_cse_budget: int, 
+                           run_cse_cap: int) -> List[Dict[str, Any]]:
+        """Implement open strategy: single broad query per POI"""
+        results = []
+        
+        for poi in pois:
+            if self.cse_calls_made >= run_cse_cap:
+                self.stopped_reason = "run_cap_reached"
+                logger.warning(f"Hit CSE cap ({run_cse_cap}), stopping")
+                break
+                
+            poi_name = poi.get('name', '')
+            poi_id = poi.get('id', '')
+            category = poi.get('category', '')
+            
+            # Single broad query: "{poi_name}" "Paris"
+            query = f'"{poi_name}" "Paris"'
+            
+            # Check daily cap gate before CSE request
+            if not self._check_daily_cap_gate():
+                break
+            
+            # Make CSE request
+            search_results = self.cse_searcher.search(query, debug=self.debug, cse_num=10)
+            self.cse_calls_made += 1
+            self._record_api_usage()
+            
+            # Capture raw items for diagnostics
+            raw_items = []
+            unique_domains = set()
+            if search_results:
+                for item in search_results[:10]:  # Limit to 10 for diagnostics
+                    url = item.get("link") or item.get("formattedUrl") or item.get("htmlFormattedUrl")
+                    displayLink = item.get("displayLink", "")
+                    formattedUrl = item.get("formattedUrl") or item.get("htmlFormattedUrl")
+                    
+                    raw_items.append({
+                        "title": item.get("title", ""),
+                        "url": url,
+                        "displayLink": displayLink,
+                        "snippet": item.get("snippet", "")
+                    })
+                    
+                    # Extract domain for diagnostics
+                    domain = domain_of(url, displayLink, formattedUrl)
+                    if domain:
+                        unique_domains.add(domain)
+                
+                if self.debug:
+                    domains_list = sorted(list(unique_domains))
+                    logger.info(f"OPEN_QUERY q='{query}' items={len(search_results)} domains={domains_list}")
+            
+            if not search_results:
+                self.pois_processed += 1
+                continue
+            
+            # Process results into candidates
+            candidates = self._process_search_results(search_results, poi_name, poi_id, category)
+            
+            # Check for accepted candidates and top score
+            accepted_candidates = [c for c in candidates if c['accepted']]
+            if candidates:
+                top_score = max(c['score'] for c in candidates)
+                self.top_score_last_poi = round(top_score, 2)  # Store for summary
+                
+                # Store top score contribution breakdown for diagnostics
+                best_candidate = max(candidates, key=lambda c: c['score'])
+                self._top_score_contrib = {
+                    "name": round(best_candidate.get('name_score', 0.0), 3),
+                    "geo": round(best_candidate.get('geo_hint', 0.0), 3),
+                    "cat": round(best_candidate.get('cat_score', 0.0), 3),
+                    "auth": round(best_candidate.get('authority_weight', 0.0), 3)
+                }
+            else:
+                top_score = 0.0
+            
+            # If no accepted candidates and budget allows, try relaxed query first
+            if not accepted_candidates and poi_cse_budget >= 2 and self.cse_calls_made < run_cse_cap:
+                # Try relaxed variant without strict quotes
+                if not self._check_daily_cap_gate():
+                    break
+                    
+                query_relaxed = f'{poi_name} Paris'
+                relaxed_results = self.cse_searcher.search(query_relaxed, debug=self.debug, cse_num=10)
+                self.cse_calls_made += 1
+                self._record_api_usage()
+                
+                if relaxed_results:
+                    relaxed_candidates = self._process_search_results(relaxed_results, poi_name, poi_id, category)
+                    relaxed_accepted = [c for c in relaxed_candidates if c['accepted']]
+                    accepted_candidates.extend(relaxed_accepted)
+                    
+                    # Update top score from relaxed results
+                    if relaxed_candidates:
+                        relaxed_top = max(c['score'] for c in relaxed_candidates)
+                        top_score = max(top_score, relaxed_top)
+                        self.top_score_last_poi = round(top_score, 2)
+            
+            # If still no accepted candidates OR top_score < 0.75, try fallback to priority domains
+            if (not accepted_candidates or top_score < 0.75) and self.cse_calls_made < run_cse_cap:
+                remaining_budget = max(0, poi_cse_budget - self.cse_calls_made)
+                if remaining_budget > 0:
+                    fallback_results = self._try_priority_domain_fallback(poi, remaining_budget, run_cse_cap)
+                    accepted_candidates.extend(fallback_results)
+            
+            results.extend(accepted_candidates)
+            
+            # Update metrics
+            self.pois_processed += 1
+            if len(raw_items) > 0:  # Based on raw items count
+                self.pois_with_candidates += 1
+            if accepted_candidates:
+                self.pois_with_accepts += 1
+                
+            # Store raw items for no-acceptance diagnostics
+            if not accepted_candidates and raw_items:
+                # Add domain to raw items for diagnostics
+                for i, item in enumerate(raw_items):
+                    if 'domain' not in item:
+                        item['domain'] = domain_of(item.get('url'), item.get('displayLink'), item.get('url'))
+                
+                # Store for later output
+                if not hasattr(self, '_last_raw_items'):
+                    self._last_raw_items = []
+                self._last_raw_items = raw_items[:5]  # Store first 5 items
+                self._last_query = query
+                self._last_unique_domains = sorted(list(unique_domains))
+                
+            # Collect samples for QA
+            if accepted_candidates:
+                for candidate in accepted_candidates[:2]:  # Max 2 per POI
+                    if len(self.samples) < 10:  # Global max 10
+                        self.samples.append({
+                            "poi_name": poi_name,
+                            "domain": candidate.get('domain', ''),
+                            "url": candidate.get('url', ''),
+                            "score": candidate.get('score', 0.0),
+                            "why": {
+                                "name": candidate.get('name_score', 0.0),
+                                "geo": candidate.get('geo_hint', 0.0),
+                                "auth": candidate.get('authority_weight', 0.0)
+                            }
+                        })
+            
+        return results
+    
+    def _process_search_results(self, search_results: List[Dict[str, Any]], poi_name: str, 
+                               poi_id: str, category: str) -> List[Dict[str, Any]]:
+        """Process CSE search results into scored candidates"""
+        candidates = []
+        domain_best = {}  # Keep best candidate per domain
+        
+        for item in search_results:
+            title = item.get('title', '')
+            snippet = item.get('snippet', '')
+            url = item.get('link') or item.get('formattedUrl') or item.get('htmlFormattedUrl')
+            displayLink = item.get('displayLink', '')
+            formattedUrl = item.get('formattedUrl') or item.get('htmlFormattedUrl')
+            
+            domain = domain_of(url, displayLink, formattedUrl)
+            
+            # Don't skip empty domains if displayLink exists - apply authority floor instead
+            if not title and not snippet:
+                continue  # Skip truly empty results
+            
+            # Calculate authority and score with authority floor
+            authority = calculate_authority(domain, self.source_catalog)
+            
+            # Authority floor: If domain=="" but displayLink present: authority = max(authority, 0.05)
+            if not domain and displayLink:
+                authority = max(authority, 0.05)
+            
+            # Calculate all score components for diagnostics
+            name_score = fuzzy_score(poi_name, title + " " + snippet)
+            geo_score = geo_hint(title, snippet, url or displayLink)  
+            cat_score = cat_hint(title, snippet, category)
+            score = calculate_score(poi_name, title, snippet, url or displayLink, category, authority)
+            
+            # Check if acceptable
+            accepted = is_acceptable(score, geo_score)
+            
+            candidate = {
+                'poi_id': poi_id,
+                'poi_name': poi_name,
+                'domain': domain,
+                'url': url or displayLink,
+                'title': title,
+                'snippet': snippet,
+                'score': score,
+                'name_score': name_score,
+                'geo_hint': geo_score,
+                'cat_score': cat_score,
+                'authority_weight': authority,
+                'accepted': accepted
+            }
+            
+            # Keep best candidate per domain using stable tie-breaker
+            if domain not in domain_best or is_better_candidate(candidate, domain_best[domain]):
+                domain_best[domain] = candidate
+        
+        return list(domain_best.values())
+    
+    def _try_priority_domain_fallback(self, poi: Dict[str, Any], remaining_budget: int, 
+                                     run_cap: int) -> List[Dict[str, Any]]:
+        """Try fallback queries on priority domains"""
+        if remaining_budget <= 0 or self.cse_calls_made >= run_cap:
+            return []
+        
+        poi_name = poi.get('name', '')
+        poi_id = poi.get('id', '')
+        category = poi.get('category', '')
+        results = []
+        
+        # Try one MDQ over priority domains (split into chunks of 4)
+        priority_list = self.priority_domains
+        chunk_size = 4
+        
+        for i in range(0, len(priority_list), chunk_size):
+            if self.cse_calls_made >= run_cap or remaining_budget <= 0:
+                break
+                
+            chunk = priority_list[i:i + chunk_size]
+            # Create multi-domain query: (site:domain1.com OR site:domain2.com) "poi_name"
+            domain_filters = ' OR '.join([f'site:{domain}' for domain in chunk])
+            query = f'({domain_filters}) "{poi_name}"'
+            
+            # Check daily cap gate before CSE request
+            if not self._check_daily_cap_gate():
+                break
+                
+            search_results = self.cse_searcher.search(query, debug=self.debug, cse_num=10)
+            self.cse_calls_made += 1
+            self._record_api_usage()
+            remaining_budget -= 1
+            
+            if search_results:
+                candidates = self._process_search_results(search_results, poi_name, poi_id, category)
+                accepted = [c for c in candidates if c['accepted']]
+                results.extend(accepted)
+                
+                # If we found something, we can stop
+                if accepted:
+                    break
+        
+        return results
+    
+    def _scan_whitelist_strategy(self, pois: List[Dict[str, Any]], poi_cse_budget: int, 
+                                run_cse_cap: int) -> List[Dict[str, Any]]:
+        """Implement whitelist strategy: priority domains only"""
+        results = []
+        
+        for poi in pois:
+            if self.cse_calls_made >= run_cse_cap:
+                self.stopped_reason = "run_cap_reached"
+                logger.warning(f"Hit CSE cap ({run_cse_cap}), stopping")
+                break
+                
+            poi_results = self._try_priority_domain_fallback(poi, poi_cse_budget, run_cse_cap)
+            results.extend(poi_results)
+            
+        return results
+    
+    def _scan_hybrid_strategy(self, pois: List[Dict[str, Any]], poi_cse_budget: int, 
+                             run_cse_cap: int) -> List[Dict[str, Any]]:
+        """Implement hybrid strategy: open first, then priority domains fallback if needed"""
+        results = []
+        
+        for poi in pois:
+            if self.cse_calls_made >= run_cse_cap:
+                self.stopped_reason = "run_cap_reached"
+                logger.warning(f"Hit CSE cap ({run_cse_cap}), stopping")
+                break
+                
+            poi_name = poi.get('name', '')
+            poi_id = poi.get('id', '')
+            category = poi.get('category', '')
+            
+            # Check daily cap gate before CSE request
+            if not self._check_daily_cap_gate():
+                break
+            
+            # Step 1: Try open strategy (single broad query)
+            query = f'"{poi_name}" "Paris"'
+            search_results = self.cse_searcher.search(query, debug=self.debug, cse_num=10)
+            self.cse_calls_made += 1
+            self._record_api_usage()
+            
+            # Capture raw items for diagnostics
+            raw_items = []
+            unique_domains = set()
+            if search_results:
+                for item in search_results[:10]:  # Limit to 10 for diagnostics
+                    url = item.get("link") or item.get("formattedUrl") or item.get("htmlFormattedUrl")
+                    displayLink = item.get("displayLink", "")
+                    formattedUrl = item.get("formattedUrl") or item.get("htmlFormattedUrl")
+                    
+                    raw_items.append({
+                        "title": item.get("title", ""),
+                        "url": url,
+                        "displayLink": displayLink,
+                        "snippet": item.get("snippet", "")
+                    })
+                    
+                    # Extract domain for diagnostics
+                    domain = domain_of(url, displayLink, formattedUrl)
+                    if domain:
+                        unique_domains.add(domain)
+                
+                if self.debug:
+                    domains_list = sorted(list(unique_domains))
+                    logger.info(f"OPEN_QUERY q='{query}' items={len(search_results)} domains={domains_list}")
+            
+            accepted_candidates = []
+            top_score = 0.0
+            
+            if search_results:
+                candidates = self._process_search_results(search_results, poi_name, poi_id, category)
+                accepted_candidates = [c for c in candidates if c['accepted']]
+                if candidates:
+                    top_score = max(c['score'] for c in candidates)
+                    self.top_score_last_poi = round(top_score, 2)  # Store for summary
+            
+            # Step 2: If no accepted candidates OR top_score < 0.75, try priority domains
+            if (not accepted_candidates or top_score < 0.75) and self.cse_calls_made < run_cse_cap:
+                remaining_budget = poi_cse_budget - 1  # Already used 1 call
+                fallback_results = self._try_priority_domain_fallback(poi, remaining_budget, run_cse_cap)
+                accepted_candidates.extend(fallback_results)
+            
+            results.extend(accepted_candidates)
+            
+            # Update metrics for hybrid strategy
+            self.pois_processed += 1
+            if len(raw_items) > 0:  # Based on raw items count
+                self.pois_with_candidates += 1
+            if accepted_candidates:
+                self.pois_with_accepts += 1
+                
+            # Store raw items for no-acceptance diagnostics
+            if not accepted_candidates and raw_items:
+                # Add domain to raw items for diagnostics
+                for i, item in enumerate(raw_items):
+                    if 'domain' not in item:
+                        item['domain'] = domain_of(item.get('url'), item.get('displayLink'), item.get('url'))
+                
+                # Store for later output
+                if not hasattr(self, '_last_raw_items'):
+                    self._last_raw_items = []
+                self._last_raw_items = raw_items[:5]  # Store first 5 items
+                self._last_query = query
+                self._last_unique_domains = sorted(list(unique_domains))
+                
+            # Collect samples for QA
+            if accepted_candidates:
+                for candidate in accepted_candidates[:2]:  # Max 2 per POI
+                    if len(self.samples) < 10:  # Global max 10
+                        self.samples.append({
+                            "poi_name": poi_name,
+                            "domain": candidate.get('domain', ''),
+                            "url": candidate.get('url', ''),
+                            "score": candidate.get('score', 0.0),
+                            "why": {
+                                "name": candidate.get('name_score', 0.0),
+                                "geo": candidate.get('geo_hint', 0.0),
+                                "auth": candidate.get('authority_weight', 0.0)
+                            }
+                        })
+            
+        return results
+    
+    def _create_final_summary(self, strategy: str, results: List[Dict[str, Any]], 
+                             start_time: float) -> Dict[str, Any]:
+        """Create final JSON summary for strategy-based scanning"""
+        end_time = time.time()
+        
+        # Categorize results
+        accepted_results = [r for r in results if r['accepted']]
+        known_domain_count = sum(1 for r in accepted_results if r['domain'] in self.source_catalog)
+        long_tail_count = len(accepted_results) - known_domain_count
+        
+        # Write results to database
+        writes_count = 0
+        if accepted_results:
+            writes_count = self._write_strategy_results_to_db(accepted_results)
+        
+        # Calculate POI stats
+        pois_processed = len(set(r['poi_id'] for r in results))
+        avg_calls_per_poi = round(self.cse_calls_made / max(pois_processed, 1), 2)
+        
+        summary = {
+            "step": "mention_scan",
+            "strategy": strategy,
+            "pois_loaded": self.pois_loaded,
+            "pois_processed": self.pois_processed,
+            "pois_with_candidates": self.pois_with_candidates,
+            "pois_with_accepts": self.pois_with_accepts,
+            "stopped_reason": self.stopped_reason,
+            "accepted": len(accepted_results),
+            "rejected": len(results) - len(accepted_results),
+            "deduped": 0,  # No deduplication in strategy mode for now
+            "writes": writes_count,
+            "cse": {
+                "calls": self.cse_calls_made,
+                "429": getattr(self.cse_searcher, 'error_429_count', 0),
+                "used_today": self.used_today,
+                "cap": self.daily_cap,
+                "usage_persisted": self.usage_persisted,
+                "poi_avg_calls": avg_calls_per_poi
+            },
+            "long_tail_accepted": long_tail_count,
+            "known_domains_accepted": known_domain_count,
+            "duration_s": round(end_time - start_time, 2)
+        }
+        
+        # Include top_score_last_poi when no acceptance occurred
+        if len(accepted_results) == 0 and hasattr(self, 'top_score_last_poi') and self.top_score_last_poi is not None:
+            summary["top_score_last_poi"] = self.top_score_last_poi
+            
+            # Add top score contribution breakdown if available
+            if hasattr(self, '_top_score_contrib'):
+                summary["top_score_contrib"] = self._top_score_contrib
+            
+        # Add hint for diagnostic purposes
+        if self.stopped_reason == "ok" and len(accepted_results) == 0:
+            summary["hint"] = "No candidates; inspect mention_scan_raw block for query & items"
+        
+        
+        # Track CSE usage persistently
+        if self.cse_calls_made > 0:
+            self._track_cse_usage(self.cse_calls_made, strategy)
+        
+        # Add samples to summary for later access
+        summary["_samples"] = self.samples  # Internal field for QA samples
+        
+        logger.info(f"📊 Final summary: {len(accepted_results)} accepted, {self.stopped_reason}")
+        
+        return summary
+    
+    def _write_strategy_results_to_db(self, results: List[Dict[str, Any]]) -> int:
+        """Write strategy-based results to database"""
+        # Group results by POI to handle 'web_other' constraint (max 1 per POI)
+        poi_results = {}
+        for result in results:
+            poi_id = result['poi_id']
+            if poi_id not in poi_results:
+                poi_results[poi_id] = {'known': [], 'unknown': []}
+            
+            domain = result['domain']
+            if domain in self.source_catalog:
+                poi_results[poi_id]['known'].append(result)
+            else:
+                poi_results[poi_id]['unknown'].append(result)
+        
+        # Write to database
+        writes_count = 0
+        for poi_id, poi_data in poi_results.items():
+            # Write known domains (use their source_id from catalog)
+            for result in poi_data['known']:
+                domain = result['domain']
+                source_id, authority_weight, source_type = self.source_catalog[domain]
+                
+                payload = {
+                    'poi_id': poi_id,
+                    'source_id': source_id,
+                    'url': result['url'],
+                    'excerpt': result['snippet'][:200] if result['snippet'] else '',  # Truncate to reasonable length
+                    'authority_weight': authority_weight,
+                    'last_seen_at': datetime.now(timezone.utc).isoformat()
+                }
+                
+                try:
+                    # Upsert to source_mention table
+                    self.db.client.table('source_mention')\
+                        .upsert(payload, on_conflict='poi_id,source_id')\
+                        .execute()
+                    
+                    writes_count += 1
+                    if self.debug:
+                        logger.info(f"Upserted known domain mention: POI {poi_id}, source {source_id}")
+                        
+                except Exception as e:
+                    logger.error(f"Failed to upsert known domain mention: {e}")
+            
+            # Write unknown domains (select best one, use 'web_other' source_id)
+            if poi_data['unknown']:
+                # Select best unknown domain result by score
+                best_unknown = max(poi_data['unknown'], key=lambda x: x['score'])
+                
+                # Check if existing web_other exists for idempotence
+                try:
+                    existing_result = self.db.client.table('source_mention')\
+                        .select('authority_weight, url')\
+                        .eq('poi_id', poi_id)\
+                        .eq('source_id', 'web_other')\
+                        .execute()
+                    
+                    existing_record = existing_result.data[0] if existing_result.data else None
+                    
+                    # Only proceed if no existing record or new candidate is better
+                    should_upsert = True
+                    if existing_record:
+                        # Reconstruct existing candidate for proper tie-breaker comparison
+                        existing_candidate = {
+                            'score': existing_record['authority_weight'],  # Using authority_weight as score proxy
+                            'authority_weight': existing_record['authority_weight'],
+                            'domain': urlparse(existing_record['url']).netloc
+                        }
+                        new_candidate = {
+                            'score': best_unknown['score'],
+                            'authority_weight': best_unknown['authority_weight'],
+                            'domain': best_unknown['domain']
+                        }
+                        
+                        # Use full tie-breaker logic: only upsert if new candidate is strictly better
+                        if not is_better_candidate(new_candidate, existing_candidate):
+                            should_upsert = False
+                            if self.debug:
+                                logger.info(f"Keeping existing web_other for POI {poi_id}: existing candidate wins tie-breaker")
+                    
+                    if should_upsert:
+                        payload = {
+                            'poi_id': poi_id,
+                            'source_id': 'web_other',  # Assume this enum value exists
+                            'url': best_unknown['url'],
+                            'excerpt': best_unknown['snippet'][:200] if best_unknown['snippet'] else '',
+                            'authority_weight': best_unknown['authority_weight'],  # Use computed authority
+                            'last_seen_at': datetime.now(timezone.utc).isoformat()
+                        }
+                        
+                        # Upsert to source_mention table (PK constraint ensures max 1 web_other per POI)
+                        self.db.client.table('source_mention')\
+                            .upsert(payload, on_conflict='poi_id,source_id')\
+                            .execute()
+                        
+                        writes_count += 1
+                        if self.debug:
+                            logger.info(f"Upserted long-tail mention: POI {poi_id}, domain {best_unknown['domain']}")
+                        
+                except Exception as e:
+                    logger.error(f"Failed to process web_other upsert: {e}")
+        
+        return writes_count
+    
+    def _track_cse_usage(self, calls_made: int, strategy: str) -> None:
+        """Track CSE API usage in api_usage table (optional - fails gracefully if table schema doesn't support it)"""
+        try:
+            today = datetime.now(timezone.utc).date().isoformat()
+            
+            # Try to track usage - schema may not support all fields
+            payload = {
+                'date': today,
+                'api_type': 'google_cse',
+                'calls': calls_made,  # Try different column name
+                'created_at': datetime.now(timezone.utc).isoformat()
+            }
+            
+            self.db.client.table('api_usage')\
+                .insert(payload)\
+                .execute()
+            
+            if self.debug:
+                logger.info(f"Tracked CSE usage: {calls_made} calls for {strategy} strategy on {today}")
+                
+        except Exception as e:
+            # Usage tracking is optional - log but don't fail the scan
+            if self.debug:
+                logger.warning(f"Could not track CSE usage (table schema mismatch): {e}")
+    
     def scan_mentions(self, city_slug: str = 'paris', serp_only: bool = False, cse_num: int = 10, 
                      poi_limit: int = None, sources_limit: int = None, poi_name: str = None, poi_id: str = None, 
                      source_ids: List[str] = None) -> Dict[str, Any]:
-        """Main scanning method - Sprint 3 consolidation with serp_only support"""
+        """DEPRECATED: Legacy per-source scanning method - Use scan_strategy_based() instead
+        
+        Main scanning method - Sprint 3 consolidation with serp_only support"""
         # Apply limits from config with CLI overrides
         # Special case: if poi_name is provided without poi_limit, pass None to enable ordering
         effective_poi_limit = poi_limit if poi_name and poi_limit is None else (poi_limit or self.config['limits']['poi_limit'])
@@ -1135,6 +2192,7 @@ class GattoMentionScanner:
             logger.info(f"🔍 Starting SERP-only scan for {city_slug} with cse_num={cse_num}")
             # Load limited POIs and sources for SERP mode
             pois = self._load_pois(city_slug, effective_poi_limit, poi_name=poi_name, poi_id=poi_id)
+            self.pois_loaded = len(pois) if pois else 0
             if not pois:
                 logger.warning("No POIs found for SERP scanning")
                 return {'total_mentions': 0, 'sources_processed': 0}
@@ -1156,6 +2214,7 @@ class GattoMentionScanner:
             return {'total_mentions': 0, 'sources_processed': 0}
         
         pois = self._load_pois(city_slug, effective_poi_limit, poi_name=poi_name, poi_id=poi_id)
+        self.pois_loaded = len(pois) if pois else 0
         if not pois:
             logger.warning("No POIs found for matching")
             return {'total_mentions': 0, 'sources_processed': 0}
@@ -1257,7 +2316,9 @@ class GattoMentionScanner:
         }
     
     def _scan_serp_sources(self, pois: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], city_slug: str) -> Dict[str, Any]:
-        """Scan sources using CSE_DOMAIN mode with POI-centric queries"""
+        """DEPRECATED: Legacy per-POI×per-source scanning - Use scan_strategy_based() instead
+        
+        Scan sources using CSE_DOMAIN mode with POI-centric queries"""
         all_mentions = []
         source_stats = {source_id: {'urls': 0, 'candidates': 0, 'accepted': 0, 'time': 0} for source_id in sources}
         
@@ -1962,6 +3023,12 @@ def main():
     parser.add_argument('--allow-no-cse', action='store_true', help='Allow graceful skip when CSE is unavailable (default: fail-fast)')
     parser.add_argument('--cse-health', action='store_true', help='Check CSE health with lightweight test query and exit')
     
+    # New strategy-based scanning
+    parser.add_argument('--strategy', choices=['open', 'whitelist', 'hybrid'], default='hybrid', 
+                        help='Search strategy: open (single broad query), whitelist (priority domains only), hybrid (open + fallback)')
+    parser.add_argument('--poi-cse-budget', type=int, default=2, help='Maximum CSE calls per POI')
+    parser.add_argument('--run-cse-cap', type=int, default=200, help='Maximum total CSE calls per run')
+    
     args = parser.parse_args()
     
     # Clamp cse_num to valid range
@@ -2023,19 +3090,56 @@ def main():
             print(f"CSE: FAIL error={str(e)}")
             exit(1)
     
-    # Force CSE mode if --scan-serp-only or --serp-only
+    # Force CSE mode if --scan-serp-only, --serp-only, or --strategy
     global USE_CSE, FETCH_ENABLED
-    if args.scan_serp_only or args.serp_only:
+    if args.scan_serp_only or args.serp_only or args.strategy:
         USE_CSE = True
         FETCH_ENABLED = False
     
     # Check CSE config at startup when USE_CSE is True
-    if USE_CSE or args.scan_serp_only or args.serp_only:
+    if USE_CSE or args.scan_serp_only or args.serp_only or args.strategy:
         check_cse_config(allow_no_cse=args.allow_no_cse)
     
     if args.run_mocks:
         run_mock_tests()
         return 0
+    elif args.strategy:
+        # New strategy-based scanning
+        # Initialize scanner with CSE enabled
+        scanner = GattoMentionScanner(debug=args.debug, allow_no_cse=args.allow_no_cse)
+        
+        if args.debug:
+            logger.info(f"📋 Strategy-based scan starting: {args.strategy}")
+            logger.info(f"  POI budget: {args.poi_cse_budget}, Run cap: {args.run_cse_cap}")
+        
+        # Check CSE availability
+        if not scanner._check_cse_availability():
+            print("❌ CSE unavailable - cannot proceed with strategy-based scanning")
+            return
+        
+        # Run strategy-based scanning
+        results = scanner.scan_strategy_based(
+            city_slug=args.city_slug, 
+            strategy=args.strategy,
+            poi_cse_budget=args.poi_cse_budget,
+            run_cse_cap=args.run_cse_cap,
+            poi_limit=args.poi_limit
+        )
+        
+        # Print final JSON summary
+        print(json.dumps(results, indent=2))
+        
+        # Print raw items block if accepted == 0 and raw items available
+        if results.get('accepted', 0) == 0 and hasattr(scanner, '_last_raw_items') and scanner._last_raw_items:
+            raw_output = {
+                "step": "mention_scan_raw",
+                "q": getattr(scanner, '_last_query', ''),
+                "domains": getattr(scanner, '_last_unique_domains', []),
+                "_samples_raw": [{"title": item["title"], "domain": item["domain"], "url": item["url"]} 
+                               for item in scanner._last_raw_items]
+            }
+            print(json.dumps(raw_output, indent=2))
+    
     elif args.scan_serp_only or args.serp_only:
         # Handle both --serp-only (from run_pipeline.py) and --scan-serp-only (legacy)
         scanner = GattoMentionScanner(debug=args.debug, allow_no_cse=args.allow_no_cse)
@@ -2103,17 +3207,58 @@ def main():
         print(f"  • Deduplicated: {results.get('deduplicated_count', 0)}")
         return 0
     else:
-        # Default behavior: run normal scan
+        # Default behavior: run strategy-based scan (hybrid strategy)
+        # Force CSE mode for strategy-based scanning
+        USE_CSE = True
+        FETCH_ENABLED = False
+        
         scanner = GattoMentionScanner(debug=args.debug, allow_no_cse=args.allow_no_cse)
         scanner._log_config_summary()
-        results = scanner.scan_mentions(args.city_slug, poi_limit=args.poi_limit, sources_limit=args.sources_limit,
-                                       poi_name=args.poi_name, poi_id=args.poi_id, source_ids=requested_source_ids)
-        print(f"\n🎯 Scan Results:")
-        print(f"  • Total mentions: {results['total_mentions']}")
-        print(f"  • Sources processed: {results['sources_processed']}")
-        print(f"  • URLs scanned: {results.get('total_urls', 0)}")
-        print(f"  • Candidates: {results.get('total_candidates', 0)}")
-        print(f"  • Deduplicated: {results.get('deduplicated_count', 0)}")
+        
+        # Use hybrid strategy by default with reasonable budgets
+        results = scanner.scan_strategy_based(
+            city_slug=args.city_slug,
+            strategy='hybrid',
+            poi_cse_budget=2,
+            run_cse_cap=200,
+            poi_limit=args.poi_limit,
+            poi_name=args.poi_name,
+            poi_id=args.poi_id
+        )
+        print(f"\n🎯 Strategy-Based Scan Results:")
+        print(f"  • Strategy: {results.get('strategy', 'hybrid')}")
+        print(f"  • POIs loaded: {results.get('pois_loaded', 0)}")
+        print(f"  • POIs processed: {results.get('pois_processed', 0)}")
+        print(f"  • POIs with candidates: {results.get('pois_with_candidates', 0)}")
+        print(f"  • POIs with accepts: {results.get('pois_with_accepts', 0)}")
+        print(f"  • Stopped reason: {results.get('stopped_reason', 'ok')}")
+        print(f"  • Accepted mentions: {results.get('accepted', 0)}")
+        print(f"  • Rejected mentions: {results.get('rejected', 0)}")
+        print(f"  • CSE calls: {results.get('cse', {}).get('calls', 0)}")
+        print(f"  • Daily usage: {results.get('cse', {}).get('used_today', 0)}/{results.get('cse', {}).get('cap', 0)}")
+        print(f"  • Known domains: {results.get('known_domains_accepted', 0)}")
+        print(f"  • Long tail: {results.get('long_tail_accepted', 0)}")
+        print(f"  • Duration: {results.get('duration_s', 0)}s")
+        
+        # Print QA samples if accepted > 0 and samples available  
+        if results.get('accepted', 0) > 0 and results.get('_samples'):
+            samples_output = {
+                "step": "mention_scan_sample",
+                "samples": results['_samples']
+            }
+            print(json.dumps(samples_output, indent=2))
+        
+        # Print raw items block if accepted == 0 and raw items available
+        if results.get('accepted', 0) == 0 and hasattr(scanner, '_last_raw_items') and scanner._last_raw_items:
+            raw_output = {
+                "step": "mention_scan_raw",
+                "q": getattr(scanner, '_last_query', ''),
+                "domains": getattr(scanner, '_last_unique_domains', []),
+                "_samples_raw": [{"title": item["title"], "domain": item["domain"], "url": item["url"]} 
+                               for item in scanner._last_raw_items]
+            }
+            print(json.dumps(raw_output, indent=2))
+        
         return 0
 
 
