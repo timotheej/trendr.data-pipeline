@@ -1,8 +1,4 @@
-#!/usr/bin/env python3
-"""
-Trendr Data Pipeline - Main Orchestrator (Gatto Version)
-Automated execution script for complete POI ingestion and processing pipeline.
-"""
+#!/usr/bin/env python
 import sys
 import os
 import logging
@@ -81,6 +77,9 @@ class TrendrPipelineOrchestrator:
         merged['cse_num'] = min(args.cse_num, 10)  # Cap at 10
         merged['explain'] = args.explain
         
+        # sources optionnelles depuis config (neutre si absent)
+        merged['sources'] = (self.config.get('social_proof_config', {}) or {}).get('sources')
+        
         # Seed pipeline parameters
         merged['seed_poi_name'] = args.seed_poi_name
         merged['seed_place_id'] = args.seed_place_id
@@ -121,11 +120,15 @@ class TrendrPipelineOrchestrator:
         logger.info(f"[{step_name}] 🚀 Starting: {' '.join(cmd)}")
         
         try:
+            env = os.environ.copy()
+            root = os.getcwd()
+            env['PYTHONPATH'] = f"{root}:{root}/scripts" + ((":" + env['PYTHONPATH']) if 'PYTHONPATH' in env else "")
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=1800  # 30 minutes timeout
+                timeout=1800,  # 30 minutes timeout
+                env=env
             )
             
             duration = time.time() - step_start
@@ -166,23 +169,39 @@ class TrendrPipelineOrchestrator:
     
     def _retry_without_optional_flags(self, original_cmd: List[str], step_name: str) -> bool:
         """Retry command with only essential flags for compatibility"""
-        # Keep only essential args: script name and known working flags
-        essential_cmd = [original_cmd[0], original_cmd[1]]  # python3 script.py
-        
-        # Add only the most essential parameters that should exist
-        skip_next = False
-        for i, arg in enumerate(original_cmd[2:], 2):
-            if skip_next:
-                skip_next = False
-                continue
-                
-            # Only keep the most basic flags that are likely to work
-            if arg in ['--city-slug', '--scan', '--score-city', '--backfill']:
-                if arg in ['--scan', '--backfill']:
-                    essential_cmd.append(arg)
-                elif i + 1 < len(original_cmd):
-                    essential_cmd.extend([arg, original_cmd[i + 1]])
-                    skip_next = True
+        # Handle new module invocation: python3 -m scripts.mention_scanner
+        if len(original_cmd) >= 3 and original_cmd[1] == '-m' and original_cmd[2] == 'scripts.mention_scanner':
+            essential_cmd = ['python3', '-m', 'scripts.mention_scanner']
+            
+            # Keep only essential mention scanner flags
+            skip_next = False
+            for i, arg in enumerate(original_cmd[3:], 3):
+                if skip_next:
+                    skip_next = False
+                    continue
+                    
+                # Essential flags that mention scanner needs
+                if arg in ['--mode', '--city-slug', '--poi-name', '--cse-num', '--limit-per-poi']:
+                    if i + 1 < len(original_cmd):
+                        essential_cmd.extend([arg, original_cmd[i + 1]])
+                        skip_next = True
+        else:
+            # Fallback for old script invocation: python3 script.py
+            essential_cmd = [original_cmd[0], original_cmd[1]]  # python3 script.py
+            
+            skip_next = False
+            for i, arg in enumerate(original_cmd[2:], 2):
+                if skip_next:
+                    skip_next = False
+                    continue
+                    
+                # Only keep the most basic flags that are likely to work
+                if arg in ['--city-slug', '--scan', '--score-city', '--backfill']:
+                    if arg in ['--scan', '--backfill']:
+                        essential_cmd.append(arg)
+                    elif i + 1 < len(original_cmd):
+                        essential_cmd.extend([arg, original_cmd[i + 1]])
+                        skip_next = True
         
         logger.info(f"[{step_name}] 🔄 Retry with: {' '.join(essential_cmd)}")
         return self.run_subprocess(essential_cmd, f"{step_name}-RETRY")
@@ -193,11 +212,15 @@ class TrendrPipelineOrchestrator:
         logger.info(f"[{step_name}] 🚀 Starting: {' '.join(cmd)}")
         
         try:
+            env = os.environ.copy()
+            root = os.getcwd()
+            env['PYTHONPATH'] = f"{root}:{root}/scripts" + ((":" + env['PYTHONPATH']) if 'PYTHONPATH' in env else "")
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=1800  # 30 minutes timeout
+                timeout=1800,  # 30 minutes timeout
+                env=env
             )
             
             duration = time.time() - step_start
@@ -231,47 +254,30 @@ class TrendrPipelineOrchestrator:
         return None
     
     def _parse_json_output(self, output: str) -> tuple[Optional[str], Optional[str]]:
-        """Parse JSON output from ingester and return poi_id, poi_name"""
         import json
-        
-        try:
-            # Find the first line that looks like JSON
-            for line in output.strip().split('\n'):
-                line = line.strip()
-                if line.startswith('{') and line.endswith('}'):
-                    try:
-                        data = json.loads(line)
-                        status = data.get('status')
-                        
-                        if status == 'upserted':
-                            # Extract POI ID from upserted response
-                            poi_info = data.get('poi', {})
-                            poi_id = poi_info.get('id')
-                            poi_name = poi_info.get('name')
-                            logger.info(f"✅ JSON: POI upserted with ID: {poi_id}")
-                            return poi_id, poi_name
-                            
-                        elif status == 'dry_run':
-                            # Extract POI name from dry-run response
-                            poi_preview = data.get('poi_preview', {})
-                            poi_name = poi_preview.get('name')
-                            logger.info(f"📝 JSON: POI preview name: {poi_name}")
-                            return None, poi_name
-                            
-                        elif status == 'error':
-                            # Handle error response
-                            error_msg = data.get('message', 'Unknown error')
-                            error_code = data.get('code', 'unknown')
-                            logger.error(f"❌ JSON: Seed ingestion error: {error_msg} (code: {error_code})")
-                            return None, None
-                            
-                    except json.JSONDecodeError:
-                        continue  # Try next line
-                        
-        except Exception as e:
-            logger.error(f"Failed to parse JSON output: {e}")
-            
-        # Fallback if no valid JSON found
+        # Parse ligne par ligne pour trouver le JSON valide
+        for line in output.strip().split('\n'):
+            line = line.strip()
+            if line.startswith('{') and line.endswith('}'):
+                try:
+                    data = json.loads(line)
+                    status = data.get('status')
+                    if status == 'upserted':
+                        poi_info = data.get('poi', {}) or data.get('data', {}).get('poi', {})
+                        poi_id = poi_info.get('id')
+                        poi_name = poi_info.get('name')
+                        logger.info(f"✅ JSON: POI upserted with ID: {poi_id}")
+                        return poi_id, poi_name
+                    if status == 'dry_run':
+                        poi_preview = data.get('poi_preview', {}) or data.get('data', {}).get('poi_preview', {})
+                        poi_name = poi_preview.get('name')
+                        logger.info(f"📝 JSON: POI preview name: {poi_name}")
+                        return None, poi_name
+                    if status == 'error':
+                        logger.error(f"❌ JSON: Seed ingestion error: {data.get('message','Unknown')} (code: {data.get('code','unknown')})")
+                        return None, None
+                except json.JSONDecodeError:
+                    continue
         logger.warning("No valid JSON found in ingester output")
         return None, None
     
@@ -325,20 +331,49 @@ class TrendrPipelineOrchestrator:
     
     def run_seed_mention_scan(self, poi_id: Optional[str], poi_name: Optional[str]) -> bool:
         """Run mention scanner for the seeded POI"""
-        city = self.merged_params['seed_city'] or 'paris'  # Default to paris
+        city = (self.merged_params['seed_city'] or 'paris').lower()
+        cmd = ['python3','-m','scripts.mention_scanner',
+                '--mode','serp-only' if self.merged_params.get('serp_only') else 'open',
+                '--city-slug', city,
+                '--limit-per-poi','1',
+                '--cse-num', str(self.merged_params.get('cse_num',10))]
+        if (self.config.get('social_proof_config') or {}).get('sources'):
+            cmd += ['--sources', ','.join(self.config['social_proof_config']['sources'])]
         
-        cmd = [
-            'python3', 'scripts/gatto_mention_scanner.py',
-            '--city-slug', city.lower(),
-            '--sources-limit', '5',
-            '--cse-num', '10'
-        ]
+        # Debug extras
+        debug_mode = (logger.level == logging.DEBUG) or os.getenv("SCAN_DEBUG") == "1"
+        if debug_mode:
+            cmd += [
+                '--debug',
+                '--log-drop-reasons',
+                '--jsonl-out', 'out/seed_scan.jsonl',
+                '--dump-serp', 'out/serp_dumps',
+                '--no-cache'
+            ]
+            os.makedirs('out/serp_dumps', exist_ok=True)
         
-        # Use POI ID if available, otherwise use POI name
-        if poi_id:
-            cmd.extend(['--poi-id', poi_id])
-        elif poi_name:
-            cmd.extend(['--poi-name', poi_name])
+        if poi_name:
+            if poi_id:
+                logger.info(f"SEED-MENTIONS: using poi-name {poi_name} (poi-id {poi_id})")
+            else:
+                logger.info(f"SEED-MENTIONS: using poi-name {poi_name}")
+            cmd += ['--poi-name', poi_name]
+        elif poi_id:
+            # Lookup POI name from database using poi_id
+            try:
+                from utils.database import SupabaseManager
+                db = SupabaseManager()
+                result = db.client.table('poi').select('name').eq('id', poi_id).limit(1).execute()
+                if result.data and len(result.data) > 0:
+                    poi_name = result.data[0]['name']
+                    logger.info(f"SEED-MENTIONS: resolved poi-name {poi_name} from poi-id {poi_id}")
+                    cmd += ['--poi-name', poi_name]
+                else:
+                    logger.error(f"POI ID {poi_id} not found in database")
+                    return False
+            except Exception as e:
+                logger.error(f"Failed to lookup POI name for ID {poi_id}: {e}")
+                return False
         else:
             logger.error("No POI ID or name available for mention scan")
             return False
@@ -352,6 +387,18 @@ class TrendrPipelineOrchestrator:
         # Step 1: Seed POI ingestion
         logger.info("📍 STEP 1: POI Ingestion")
         success, poi_id, poi_name = self.run_seed_ingestion()
+        
+        if not poi_id and poi_name:
+            try:
+                from utils.database import SupabaseManager
+                db = SupabaseManager()
+                # Use raw SQL query via Supabase client
+                result = db.client.table('poi').select('id').ilike('name', poi_name).eq('city_slug', (self.merged_params['seed_city'] or 'paris').lower()).order('updated_at', desc=True).limit(1).execute()
+                if result.data and len(result.data) > 0:
+                    poi_id = result.data[0]['id']
+                    logger.info(f"🔍 Fallback DB: resolved poi_id={poi_id} for '{poi_name}'")
+            except Exception as e:
+                logger.warning(f"Fallback DB failed: {e}")
         
         if not success:
             logger.error("❌ Seed ingestion failed, stopping pipeline")
@@ -422,17 +469,14 @@ class TrendrPipelineOrchestrator:
     
     def run_mentions_step(self, city: str) -> bool:
         """Run mentions scanning step"""
-        cmd = [
-            'python3', 'scripts/gatto_mention_scanner.py',
-            '--city-slug', city.lower(),
-            '--scan',
-            '--limit-per-poi', str(self.merged_params['batch_size'])
-        ]
-        
-        if self.merged_params['serp_only']:
-            cmd.append('--scan-serp-only')
-        if logger.level == logging.DEBUG:
-            cmd.append('--debug')
+        cmd = ['python3','-m','scripts.mention_scanner',
+                '--mode','serp-only' if self.merged_params.get('serp_only') else 'open',
+                '--city-slug', city.lower(),
+                '--limit-per-poi', str(self.merged_params['batch_size']),
+                '--cse-num', str(self.merged_params.get('cse_num',10))]
+        if (self.config.get('social_proof_config') or {}).get('sources'):
+            cmd += ['--sources', ','.join(self.config['social_proof_config']['sources'])]
+        if logger.level == logging.DEBUG: cmd.append('--debug')
             
         return self.run_subprocess(cmd, 'MENTIONS')
     

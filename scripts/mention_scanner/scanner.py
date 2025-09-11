@@ -72,9 +72,9 @@ class GattoMentionScanner:
         self.matcher = MentionMatcher()
         self.deduplicator = MentionDeduplicator()
         
-        # Store configured thresholds
-        self.high_threshold = high_threshold or 0.82
-        self.mid_threshold = mid_threshold or 0.33
+        # Store configured thresholds (using config_resolver defaults)
+        self.high_threshold = high_threshold or 0.82  # Matches DEFAULT_HIGH in config_resolver
+        self.mid_threshold = mid_threshold or 0.33    # Matches DEFAULT_MID in config_resolver
         
         # JSONL output configuration
         self.jsonl_writer = None
@@ -82,6 +82,13 @@ class GattoMentionScanner:
             self.jsonl_writer = JSONLWriter(jsonl_out, config=self.config, cli_jsonl=True)
             self.jsonl_writer.log_drop_reasons = log_drop_reasons
             self.jsonl_writer.initialize()
+        
+        # Debug mode DROP logging (enabled with SCAN_DEBUG=1 or log_drop_reasons config)
+        self.debug_drop_logging = (
+            os.getenv('SCAN_DEBUG') == '1' or
+            log_drop_reasons or
+            (config and config.get('mention_scanner', {}).get('logging', {}).get('log_drop_reasons', False))
+        )
         
         # Metrics tracking
         self.pois_loaded = 0
@@ -95,18 +102,52 @@ class GattoMentionScanner:
         self.total_candidates = 0
         self.total_accepted = 0
         self.total_rejected = 0
-        self.total_upserts = 0
-        self.domains_accepted = {}  # domain -> count
-        
-        # Daily cap tracking
-        self.used_today = 0
-        self.daily_cap = CSE_DAILY_CAP
-        self.usage_persisted = False
-        self.api_usage_disabled = False
         
         # Initialize CSE searcher
-        self.cse_searcher = None
         self._initialize_cse()
+    
+    def _enrich_poi_with_coords(self, poi: dict) -> dict:
+        """Enrichir un POI avec lat/lng depuis la DB"""
+        if poi.get("lat") is not None and poi.get("lng") is not None:
+            return poi
+        try:
+            from utils.database import SupabaseManager
+        except Exception:
+            logger.warning(f"Database module not found, skipping POI enrichment for {poi.get('name')}")
+            return poi
+        
+        try:
+            db = SupabaseManager()
+
+            # Try to find POI by name and city using available methods
+            results = []
+            try:
+                results = db.get_pois_by_name(poi["name"], poi.get("city_slug", ""))
+                if not results:
+                    # Try without city filter
+                    all_results = db.get_pois_by_name(poi["name"], "")
+                    # Filter by city manually if city_slug is provided
+                    if poi.get("city_slug"):
+                        results = [r for r in all_results if r.get("city_slug") == poi.get("city_slug")]
+                    else:
+                        results = all_results
+            except Exception as e:
+                logger.debug(f"Error querying POI by name: {e}")
+            
+            if results:
+                row = results[0]  # Take first match
+                try:
+                    poi["lat"] = float(row["lat"]) if row.get("lat") is not None else None
+                    poi["lng"] = float(row["lng"]) if row.get("lng") is not None else None
+                    poi.setdefault("city_slug", row.get("city_slug"))
+                    poi.setdefault("category", row.get("category"))
+                    poi["id"] = row.get("id")  # Use real POI ID from database
+                    logger.info(f"Enriched POI '{poi['name']}' with coords: lat={poi['lat']}, lng={poi['lng']}")
+                except Exception:
+                    logger.debug("Coords not castable for %r", poi.get("name"))
+        except Exception as e:
+            logger.warning(f"Failed to enrich POI {poi.get('name')} with coordinates: {e}")
+        return poi
     
     def _initialize_cse(self):
         """Initialize CSE searcher with config"""
@@ -149,7 +190,9 @@ class GattoMentionScanner:
         
         try:
             for poi_name in poi_names:
-                poi = {"id": f"poi_{poi_name}", "name": poi_name, "category": "restaurant"}
+                poi = {"id": f"poi_{poi_name}", "name": poi_name, "category": "restaurant", "city_slug": city_slug}
+                # enrichir chaque POI avec coords DB avant tout matching
+                poi = self._enrich_poi_with_coords(poi)
                 summary.increment_poi()
                 self.run_serp_pipeline(
                     poi=poi,
@@ -206,7 +249,9 @@ class GattoMentionScanner:
         try:
             # Get POIs from database (mock for now - in real implementation would query DB)
             for poi_name in poi_names:
-                poi = {"id": f"poi_{poi_name}", "name": poi_name, "category": "restaurant"}
+                poi = {"id": f"poi_{poi_name}", "name": poi_name, "category": "restaurant", "city_slug": city_slug}
+                # enrichir chaque POI avec coords DB avant tout matching
+                poi = self._enrich_poi_with_coords(poi)
                 summary.increment_poi()
                 self.run_serp_pipeline(
                     poi=poi,
@@ -344,6 +389,16 @@ class GattoMentionScanner:
         candidates = []
         accepted_count = 0
         
+        # Step-by-step counters for debugging
+        serp_items_total = 0
+        candidates_created = 0
+        candidates_scored = 0
+        drop_reasons_seen = []
+        
+        # Debug scoring for first N items
+        debug_scoring_limit = 5  # Could be made configurable
+        items_detailed = 0
+        
         for query in queries:
             if not self.cse_searcher:
                 logger.warning("CSE searcher not available, skipping query")
@@ -352,43 +407,137 @@ class GattoMentionScanner:
             # Search with CSE (pass summary for cache stats)
             results = self.cse_searcher.search(query, debug=self.debug, cse_num=cse_num, summary=summary, 
                                              no_cache=no_cache, dump_serp_dir=dump_serp_dir)
+            logger.info(f"CSE search for '{query}' returned {len(results) if results else 0} results")
             summary.increment_cse_call()
             
             # Count SERP items
             if hasattr(summary, 'serp_items_total'):
                 summary.serp_items_total += len(results)
             
+            logger.info(f"Query '{query}' returned {len(results)} results")
+            if not results:
+                logger.info(f"No results for query '{query}', skipping")
+                continue
+            
+            # Count SERP items for this query
+            serp_items_total += len(results)
+            
             for item in results:
                 # Create candidate object
                 url = item.get('link', item.get('formattedUrl', ''))
+                title = item.get('title', '')
+                snippet = item.get('snippet', '')
+                source_domain = domain_of(url)
+                
+                # Log SERP item processing
+                if self.debug_drop_logging:
+                    logger.info("SERP[%s]: %s | url=%s | title=%s | snippet=%s | poi_context(name='%s', city=%s, lat=%s, lng=%s)",
+                               source_domain, url, url, title[:100], snippet[:100], 
+                               poi.get('name'), poi.get('city_slug') or poi.get('city'), poi.get('lat'), poi.get('lng'))
+                
                 candidate = {
                     'url': url,
                     'displayLink': item.get('displayLink', ''),
                     'formattedUrl': item.get('formattedUrl', ''),
-                    'title': item.get('title', ''),
-                    'snippet': item.get('snippet', ''),
+                    'title': title,
+                    'snippet': snippet,
                     'published_at': item.get('pagemap', {}).get('metatags', [{}])[0].get('article:published_time'),
-                    'domain': domain_of(url),
-                    'source_domain': domain_of(url),
+                    'domain': source_domain,
+                    'source_domain': source_domain,
                     'query_used': query,
                     'poi_id': poi_id,
                     'poi_name': poi_name
                 }
                 
+                # Count candidate creation
+                candidates_created += 1
+                
                 # Matching score
+                # LOG: ce qu'on envoie vraiment au matcher
+                logger.info("POI context → name='%s', lat=%s, lng=%s, city=%s",
+                           poi.get('name'), poi.get('lat'), poi.get('lng'), poi.get('city_slug') or poi.get('city'))
                 match_result = self.matcher.match_poi_to_article(poi, candidate['title'], config=config, cli_overrides=cli_overrides)
                 if not match_result:
+                    if self.debug_drop_logging:
+                        # Get detailed reason from matcher by calling it again in debug mode
+                        poi_name = poi.get('name', '')
+                        poi_norm = self.matcher.normalize(poi_name) 
+                        title_norm = self.matcher.normalize(candidate['title'])
+                        trigram_score = self.matcher.trigram_score(poi_norm, title_norm)
+                        
+                        # Use already resolved thresholds (no need to re-resolve here)
+                        
+                        if trigram_score < mid_threshold:
+                            reason = f"trigram_too_low: {trigram_score:.3f} < {mid_threshold}"
+                        elif trigram_score < high_threshold:
+                            # Check if this is specifically a token requirement failure
+                            poi_tokens = set(self.matcher.extract_tokens(poi.get('name', '')))
+                            title_tokens = set(self.matcher.extract_tokens(candidate['title']))
+                            has_discriminant = bool(poi_tokens & title_tokens)
+                            
+                            # Get token_required setting
+                            token_required = True
+                            if config and 'mention_scanner' in config:
+                                name_match_cfg = config['mention_scanner'].get('name_match', {})
+                                token_required = name_match_cfg.get('require_token_for_mid', True)
+                            
+                            if token_required and not has_discriminant:
+                                reason = f"token_required_mid: trigram={trigram_score:.3f} >= {mid_threshold} but no token match"
+                            else:
+                                reason = f"trigram_mid_range: {trigram_score:.3f}, failed other requirements (geo/etc)"
+                        else:
+                            reason = "unknown_matcher_rejection"
+                            
+                        # Collect drop reasons for summary
+                        drop_reasons_seen.append(reason)
+                            
+                        # Use specific DROP category for token requirements
+                        drop_category = "token_required_mid" if "token_required_mid" in reason else "matching_failed"
+                        logger.info("DROP[%s]: %s | %s | trigram=%.3f | title='%s'", 
+                                   drop_category, url, reason, trigram_score, candidate['title'][:100])
                     continue
                     
                 summary.increment_candidate()
                 
-                # Calculate final score
-                score = final_score(poi_name, candidate['title'], candidate['snippet'], 
-                                   candidate['url'], poi_category, config)
+                # Calculate final score (with debug for first N items)
+                show_debug = self.debug_drop_logging and items_detailed < debug_scoring_limit
+                
+                if show_debug:
+                    score, explain = final_score(poi_name, candidate['title'], candidate['snippet'], 
+                                                candidate['url'], poi_category, config, debug=True)
+                else:
+                    score = final_score(poi_name, candidate['title'], candidate['snippet'], 
+                                       candidate['url'], poi_category, config)
                 
                 candidate['score'] = score
                 candidate['match_score'] = match_result.get('score', 0.0)
                 candidate['geo_score'] = match_result.get('geo_score', 0.0)
+                
+                # Count candidate scoring
+                candidates_scored += 1
+                
+                # Log detailed scoring breakdown for first N items
+                if show_debug:
+                    items_detailed += 1
+                    logger.info("🔍 DETAILED SCORING #%d: %s", items_detailed, url[:60])
+                    logger.info("  Title: '%s'", candidate['title'][:80])
+                    logger.info("  Components: name=%.3f geo=%.3f cat=%.3f auth=%.3f pen=%.3f", 
+                               explain['components']['name_match'],
+                               explain['components']['geo_score'], 
+                               explain['components']['cat_score'],
+                               explain['components']['authority'],
+                               explain['components']['penalties'])
+                    logger.info("  Weighted: name=%.3f geo=%.3f cat=%.3f auth=%.3f pen=%.3f",
+                               explain['weighted_components']['name_component'],
+                               explain['weighted_components']['geo_component'],
+                               explain['weighted_components']['cat_component'],
+                               explain['weighted_components']['authority_component'], 
+                               explain['weighted_components']['penalty_component'])
+                    logger.info("  Score: raw=%.3f final=%.3f | Match: trigram=%.3f geo=%.3f",
+                               explain['raw_score'], explain['final_score'],
+                               candidate['match_score'], candidate['geo_score'])
+                    logger.info("  Thresholds: high=%.3f mid=%.3f | Domain: %s", 
+                               high_threshold, mid_threshold, explain['domain'])
                 
                 # Check acceptance
                 drop_reasons = []
@@ -399,9 +548,23 @@ class GattoMentionScanner:
                         drop_reasons.append(f"score_too_low: {score:.3f} < {high_threshold}")
                     if candidate.get('geo_score', 0.0) < mid_threshold:
                         drop_reasons.append(f"geo_score_too_low: {candidate.get('geo_score', 0.0):.3f} < {mid_threshold}")
+                    
+                    # Collect drop reasons for summary
+                    drop_reasons_seen.extend(drop_reasons)
+                    
+                    # Log DROP for threshold failures
+                    if self.debug_drop_logging:
+                        logger.info("DROP[threshold_failed]: %s | reasons=%s | score=%.3f | geo_score=%.3f", 
+                                   url, ', '.join(drop_reasons), score, candidate.get('geo_score', 0.0))
                 
                 candidate['drop_reasons'] = drop_reasons
                 candidate['acceptable'] = acceptable
+                
+                # Log decision for detailed items
+                if show_debug:
+                    decision = "ACCEPTED" if acceptable else "REJECTED"
+                    reasons_text = f" | reasons: {', '.join(drop_reasons)}" if drop_reasons else ""
+                    logger.info("  Decision: %s%s", decision, reasons_text)
                 
                 # Write to JSONL if enabled
                 if jsonl_writer and jsonl_writer.enabled:
@@ -443,10 +606,31 @@ class GattoMentionScanner:
                 if url not in seen_urls:
                     seen_urls.add(url)
                     deduplicated_accepted.append(candidate)
+                else:
+                    # Log DROP for duplicate URLs
+                    if self.debug_drop_logging:
+                        logger.info("DROP[duplicate_url]: %s | reason=URL already seen in this scan", url)
             
             # Note: summary counters already incremented during processing
             
-        logger.info(f"POI {poi_name}: {len(queries)} queries, {len(candidates)} candidates, {accepted_count} accepted")
+        # Log step-by-step counters for debugging
+        rejected_count = candidates_scored - accepted_count
+        logger.info(f"POI {poi_name} processing summary:")
+        logger.info(f"  • Queries executed: {len(queries)}")
+        logger.info(f"  • SERP items returned: {serp_items_total}")
+        logger.info(f"  • Candidates created: {candidates_created}")
+        logger.info(f"  • Candidates scored: {candidates_scored}")
+        logger.info(f"  • Accepted: {accepted_count}")
+        logger.info(f"  • Rejected: {rejected_count}")
+        
+        # If no candidates were created, log top 3 distinct drop reasons
+        if candidates_created == 0 and drop_reasons_seen:
+            from collections import Counter
+            reason_counts = Counter(drop_reasons_seen)
+            top_reasons = reason_counts.most_common(3)
+            logger.info(f"  • Top 3 drop reasons (no candidates created):")
+            for i, (reason, count) in enumerate(top_reasons, 1):
+                logger.info(f"    {i}. {reason} ({count} occurrences)")
 
     def run_serp_only_for_poi(self, poi: Dict[str, Any], source_ids: List[str], config: Dict[str, Any], 
                              summary, jsonl_writer, cli_overrides, cse_num: int, limit_per_poi: int = None):

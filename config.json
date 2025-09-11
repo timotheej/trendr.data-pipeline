@@ -37,7 +37,12 @@
     "cache_enabled": true,
     "cache_ttl_hours": 48,
     "authority_threshold": 0.3,
-    "min_proof_sources": 1
+    "min_proof_sources": 1,
+    "sources": [
+      "lefooding.com",
+      "timeout.fr",
+      "sortiraparis.com"
+    ]
   },
 
   "mention_scanner": {

@@ -158,8 +158,26 @@ def calculate_penalties(domain: str, url: str, config: Optional[Dict[str, Any]] 
     return penalties
 
 def final_score(poi_name: str, title: str, snippet: str, url: str, 
-                poi_category: str, config: Optional[Dict[str, Any]] = None) -> float:
-    """Calculate final score combining authority, boosts, and decay"""
+                poi_category: str, config: Optional[Dict[str, Any]] = None, debug: bool = False) -> Union[float, Tuple[float, Dict[str, Any]]]:
+    """Calculate final score combining authority, boosts, and decay
+    
+    Args:
+        poi_name: POI name to match against
+        title: Article title
+        snippet: Article snippet
+        url: Article URL
+        poi_category: POI category
+        config: Configuration dict
+        debug: If True, return (score, explain_dict) tuple
+        
+    Returns:
+        float: Final score (0.0-1.0), or tuple of (score, explain_dict) if debug=True
+    """
+    import os
+    
+    # Check if debug mode is enabled
+    debug_enabled = debug or os.getenv('SCAN_DEBUG') == '1'
+    
     domain = domain_of(url)
     
     # Calculate components
@@ -186,7 +204,37 @@ def final_score(poi_name: str, title: str, snippet: str, url: str,
              authority_weight * authority - 
              penalties)
     
-    return max(0.0, min(1.0, score))
+    final_score_value = max(0.0, min(1.0, score))
+    
+    if debug_enabled:
+        explain = {
+            'components': {
+                'name_match': round(name_match, 3),
+                'geo_score': round(geo_score, 3), 
+                'cat_score': round(cat_score, 3),
+                'authority': round(authority, 3),
+                'penalties': round(penalties, 3)
+            },
+            'weights': {
+                'name_weight': name_weight,
+                'geo_weight': geo_weight,
+                'cat_weight': cat_weight,
+                'authority_weight': authority_weight
+            },
+            'weighted_components': {
+                'name_component': round(name_weight * name_match, 3),
+                'geo_component': round(geo_weight * geo_score, 3),
+                'cat_component': round(cat_weight * cat_score, 3), 
+                'authority_component': round(authority_weight * authority, 3),
+                'penalty_component': round(-penalties, 3)
+            },
+            'raw_score': round(score, 3),
+            'final_score': round(final_score_value, 3),
+            'domain': domain
+        }
+        return final_score_value, explain
+    
+    return final_score_value
 
 def is_acceptable(candidate: Dict[str, Any], thresholds: Dict[str, float], rules: Dict[str, Any]) -> bool:
     """Check if candidate meets acceptance criteria using exact current logic"""
