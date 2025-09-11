@@ -313,6 +313,25 @@ class GattoMentionScanner:
         # Resolve thresholds from CLI > config > defaults
         high_threshold, mid_threshold = _resolve_thresholds(cli_overrides, config)
         
+        # Apply DEBUG mode threshold overrides
+        debug_override = False
+        if os.getenv('SCAN_DEBUG') == '1':
+            high_threshold = 0.30  # Much lower for debugging
+            mid_threshold = 0.15   # Much lower for debugging
+            debug_override = True
+            logger.info("🐛 DEBUG MODE: thresholds_effective high=%.2f, mid=%.2f (debug_override=True)", 
+                       high_threshold, mid_threshold)
+            
+            # Override token_required in debug mode to allow more matches
+            cli_overrides.token_required_for_mid = False
+            # Override thresholds for matcher too
+            cli_overrides.threshold_high = high_threshold  
+            cli_overrides.threshold_mid = mid_threshold
+            logger.info("🐛 DEBUG MODE: token_required_for_mid=False, thresholds updated for matcher (debug_override)")
+        else:
+            logger.info("📊 NORMAL MODE: thresholds_effective high=%.2f, mid=%.2f (debug_override=False)", 
+                       high_threshold, mid_threshold)
+        
         # Get config parameters with fallbacks
         mention_scanner_config = config.get('mention_scanner', {}) if config else {}
         query_config = mention_scanner_config.get('query_strategy', {})
@@ -501,6 +520,7 @@ class GattoMentionScanner:
                 
                 # Calculate final score (with debug for first N items)
                 show_debug = self.debug_drop_logging and items_detailed < debug_scoring_limit
+                explain = None
                 
                 if show_debug:
                     score, explain = final_score(poi_name, candidate['title'], candidate['snippet'], 
@@ -508,10 +528,21 @@ class GattoMentionScanner:
                 else:
                     score = final_score(poi_name, candidate['title'], candidate['snippet'], 
                                        candidate['url'], poi_category, config)
-                
+                    
+                # Ensure we always have a float score
+                if isinstance(score, tuple):
+                    score = score[0]  # Extract float from (score, explain) tuple if needed
+                    
                 candidate['score'] = score
-                candidate['match_score'] = match_result.get('score', 0.0)
-                candidate['geo_score'] = match_result.get('geo_score', 0.0)
+                candidate['match_score'] = match_result.get('score', 0.0) 
+                
+                # For geo_score, use scoring geo_score if available (more comprehensive than matcher)
+                if show_debug and 'explain' in locals():
+                    candidate['geo_score'] = explain['components']['geo_score'] 
+                else:
+                    # Recalculate geo_score from scoring for consistency
+                    from .scoring import geo_hint
+                    candidate['geo_score'] = geo_hint(candidate['title'], candidate['snippet'], candidate['url'])
                 
                 # Count candidate scoring
                 candidates_scored += 1
@@ -521,6 +552,32 @@ class GattoMentionScanner:
                     items_detailed += 1
                     logger.info("🔍 DETAILED SCORING #%d: %s", items_detailed, url[:60])
                     logger.info("  Title: '%s'", candidate['title'][:80])
+                    
+                    # Detailed name matching analysis
+                    from .matching import normalize
+                    from .scoring import fuzzy_score, geo_hint
+                    poi_name_norm = normalize(poi_name)
+                    title_norm = normalize(candidate['title'])
+                    name_fuzzy = fuzzy_score(poi_name, candidate['title'] + " " + candidate['snippet'])
+                    exact_substring = poi_name.lower() in candidate['title'].lower()
+                    
+                    logger.info("  📝 NAME: poi_norm='%s' vs title_norm='%s'", poi_name_norm[:50], title_norm[:50])
+                    logger.info("    trigram=%.3f fuzzy=%.3f exact_substring=%s", 
+                               match_result.get('trigram_score', 0.0), name_fuzzy, exact_substring)
+                    
+                    # Detailed geo analysis  
+                    geo_score_detail = geo_hint(candidate['title'], candidate['snippet'], candidate['url'])
+                    logger.info("  🗺️ GEO: geo_components=%.3f (used in decision)", geo_score_detail)
+                    
+                    # Check for specific geo signals
+                    title_text = candidate['title'] + " " + candidate['snippet'] + " " + candidate['url']
+                    geo_signals = []
+                    if 'paris' in title_text.lower(): geo_signals.append('paris')
+                    if '750' in title_text: geo_signals.append('postal_75xxx')
+                    if any(arr in title_text.lower() for arr in ['11e', '75011', '1er', '2e', '3e', '4e', '5e', '6e', '7e', '8e', '9e', '10e', '12e', '13e', '14e', '15e', '16e', '17e', '18e', '19e', '20e']): 
+                        geo_signals.append('arrondissement')
+                    logger.info("    geo_signals=%s", geo_signals)
+                    
                     logger.info("  Components: name=%.3f geo=%.3f cat=%.3f auth=%.3f pen=%.3f", 
                                explain['components']['name_match'],
                                explain['components']['geo_score'], 
@@ -533,15 +590,26 @@ class GattoMentionScanner:
                                explain['weighted_components']['cat_component'],
                                explain['weighted_components']['authority_component'], 
                                explain['weighted_components']['penalty_component'])
-                    logger.info("  Score: raw=%.3f final=%.3f | Match: trigram=%.3f geo=%.3f",
+                    logger.info("  Score: raw=%.3f final=%.3f | Match: trigram=%.3f geo_used=%.3f",
                                explain['raw_score'], explain['final_score'],
                                candidate['match_score'], candidate['geo_score'])
                     logger.info("  Thresholds: high=%.3f mid=%.3f | Domain: %s", 
                                high_threshold, mid_threshold, explain['domain'])
                 
-                # Check acceptance
+                # Check acceptance with type safety
                 drop_reasons = []
-                acceptable = score >= high_threshold and candidate.get('geo_score', 0.0) >= mid_threshold
+                
+                # Type safety assertions
+                if not isinstance(score, (int, float)):
+                    logger.error("FATAL: score is not numeric: %s (type: %s)", score, type(score))
+                    raise ValueError(f"Score must be numeric, got {type(score)}: {score}")
+                    
+                geo_score_value = candidate.get('geo_score', 0.0)
+                if not isinstance(geo_score_value, (int, float)):
+                    logger.error("FATAL: geo_score is not numeric: %s (type: %s)", geo_score_value, type(geo_score_value))
+                    raise ValueError(f"Geo score must be numeric, got {type(geo_score_value)}: {geo_score_value}")
+                
+                acceptable = score >= high_threshold and geo_score_value >= mid_threshold
                 
                 if not acceptable:
                     if score < high_threshold:
@@ -565,6 +633,16 @@ class GattoMentionScanner:
                     decision = "ACCEPTED" if acceptable else "REJECTED"
                     reasons_text = f" | reasons: {', '.join(drop_reasons)}" if drop_reasons else ""
                     logger.info("  Decision: %s%s", decision, reasons_text)
+                    
+                    # Compact decision line
+                    logger.info("🎯 DECISION: domain=%s, name=%.3f, geo=%.3f (used=%.3f), cat=%.3f, auth=%.3f → final=%.3f", 
+                               explain['domain'], explain['components']['name_match'], 
+                               explain['components']['geo_score'], candidate['geo_score'],
+                               explain['components']['cat_score'], explain['components']['authority'], 
+                               explain['final_score'])
+                    logger.info("   THRESHOLDS: high=%.2f, mid=%.2f", high_threshold, mid_threshold)
+                    if drop_reasons:
+                        logger.info("   DROP: %s", drop_reasons)
                 
                 # Write to JSONL if enabled
                 if jsonl_writer and jsonl_writer.enabled:

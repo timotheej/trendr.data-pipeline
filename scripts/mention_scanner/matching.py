@@ -8,9 +8,9 @@ import math
 import unicodedata
 import logging
 from typing import Dict, Any, Optional, Tuple, Set
-from .config_resolver import _resolve_thresholds
 
 logger = logging.getLogger(__name__)
+from .config_resolver import _resolve_thresholds
 
 # Pre-compiled regex patterns for normalization
 RE_PUNCTUATION_CLEANUP = re.compile(r'[^\w\s]')
@@ -103,6 +103,10 @@ class MentionMatcher:
             token_required = name_match_cfg.get('require_token_for_mid', True)
             max_distance = name_match_cfg.get('max_distance_meters', 400)
         
+        # CLI overrides have highest priority
+        if cli_overrides and hasattr(cli_overrides, 'token_required_for_mid'):
+            token_required = cli_overrides.token_required_for_mid
+        
         # Normalize names
         poi_norm = self.normalize(poi_name)
         title_norm = self.normalize(article_title)
@@ -137,9 +141,21 @@ class MentionMatcher:
         elif match_score >= mid_threshold and (not token_required or has_discriminant):
             accepted = True
         
+        # Debug logging when SCAN_DEBUG=1
+        import os
+        if os.getenv('SCAN_DEBUG') == '1':
+            logger.info("🔍 MATCHER DEBUG: trigram=%.3f, geo=%.3f, token=%.3f → match_score=%.3f", 
+                       trigram_score, geo_score, token_score, match_score)
+            logger.info("   Thresholds: high=%.3f, mid=%.3f | token_required=%s, has_discriminant=%s", 
+                       high_threshold, mid_threshold, token_required, has_discriminant)
+            logger.info("   Conditions: (score>=high)=%s, (score>=mid AND token_ok)=%s → accepted=%s", 
+                       match_score >= high_threshold, 
+                       match_score >= mid_threshold and (not token_required or has_discriminant),
+                       accepted)
+        
         if accepted:
             return {
-                'poi_id': poi['id'],
+                'poi_id': poi.get('id', 'unknown'),  # Use .get() to handle missing id
                 'match_score': round(match_score, 3),
                 'trigram_score': round(trigram_score, 3),
                 'geo_score': geo_score,
