@@ -4,10 +4,28 @@ from supabase import create_client, Client
 from tenacity import retry, stop_after_attempt, wait_exponential
 import config
 import json
+import uuid
 from datetime import datetime
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Database-specific exceptions for better error handling
+class DatabaseError(Exception):
+    """Base database error"""
+    pass
+
+class ConnectionError(DatabaseError):
+    """Database connection failed"""
+    pass
+
+class QueryError(DatabaseError):
+    """Query execution failed"""
+    pass
+
+class RetryableError(DatabaseError):
+    """Temporary error that can be retried"""
+    pass
 
 class SupabaseManager:
     """Extended Supabase manager with support for Collections, Neighborhoods, and SEO pages"""
@@ -117,6 +135,70 @@ class SupabaseManager:
         except Exception as e:
             logger.error(f"Error getting POIs by name {poi_name}: {e}")
             return []
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=8))
+    def get_pois_by_names_batch(self, poi_names: List[str], city: str) -> Dict[str, Dict[str, Any]]:
+        """
+        Batch get POIs by multiple names - solves N+1 problem
+        
+        Args:
+            poi_names: List of POI names to search
+            city: City to filter by
+            
+        Returns:
+            Dict mapping poi_name -> poi_data (first match only)
+        """
+        if not poi_names:
+            return {}
+            
+        try:
+            # Use individual queries combined - more reliable than complex OR syntax
+            poi_map = {}
+            
+            for poi_name in poi_names:
+                try:
+                    query = self.client.table('poi').select('*').ilike('name', f'%{poi_name}%')
+                    if city:
+                        # Try city_slug first (lowercase like 'paris'), then fallback to city (title case like 'Paris')
+                        if city.islower():
+                            query = query.eq('city_slug', city)
+                        else:
+                            query = query.eq('city', city)
+                    
+                    result = query.execute()
+                    if result.data:
+                        # Take first match for this POI name
+                        poi_map[poi_name] = result.data[0]
+                except Exception as single_error:
+                    logger.debug(f"Failed to query POI '{poi_name}': {single_error}")
+                    continue
+            
+            logger.debug(f"Batch POI query: {len(poi_names)} names → {len(poi_map)} matches")
+            return poi_map
+            
+        except Exception as e:
+            # Classify error and handle accordingly
+            error_str = str(e).lower()
+            
+            if 'connection' in error_str or 'network' in error_str or 'timeout' in error_str:
+                logger.warning(f"Connection error in batch POI query: {e}")
+                raise RetryableError(f"Database connection issue: {e}")
+            elif 'rate limit' in error_str or '429' in error_str:
+                logger.warning(f"Rate limit hit in batch POI query: {e}")
+                raise RetryableError(f"Database rate limit: {e}")
+            else:
+                logger.error(f"Query error in batch POI query for {len(poi_names)} names: {e}")
+                # Don't retry for syntax/schema errors, fallback to individual queries
+                poi_map = {}
+                for name in poi_names:
+                    try:
+                        pois = self.get_pois_by_name(name, city)
+                        if pois:
+                            poi_map[name] = pois[0]
+                    except Exception as fallback_error:
+                        logger.debug(f"Fallback query failed for {name}: {fallback_error}")
+                logger.warning(f"Batch query failed, fallback completed: {len(poi_map)}/{len(poi_names)} POIs found")
+                return poi_map
 
     # DEPRECATED: Using string neighborhoods instead
     def get_pois_for_neighborhood(self, neighborhood_id: str, limit: int = 50) -> List[Dict[str, Any]]:
@@ -408,6 +490,463 @@ class SupabaseManager:
             logger.error(f"Error migrating POI neighborhoods: {e}")
             return 0
     
+    # =============================================================================
+    # SOURCE MENTION METHODS
+    # =============================================================================
+    
+    # Intelligent cache for source_catalog with TTL
+    _source_catalog_cache = None
+    _source_catalog_cache_time = None
+    _CACHE_TTL_SECONDS = 300  # 5 minutes TTL
+    
+    def _load_source_catalog(self, force_refresh: bool = False):
+        """
+        Load source_catalog from database with intelligent caching
+        
+        Args:
+            force_refresh: Force cache refresh even if TTL not expired
+            
+        Returns:
+            List of source_catalog entries
+        """
+        import time
+        current_time = time.time()
+        
+        # Check if cache is expired or force refresh requested
+        cache_expired = (
+            self._source_catalog_cache is None or 
+            self._source_catalog_cache_time is None or
+            (current_time - self._source_catalog_cache_time) > self._CACHE_TTL_SECONDS or
+            force_refresh
+        )
+        
+        if cache_expired:
+            try:
+                logger.debug("Refreshing source_catalog cache (TTL expired or forced)")
+                result = self.client.table('source_catalog').select('*').execute()
+                if result.data:
+                    self._source_catalog_cache = result.data
+                    self._source_catalog_cache_time = current_time
+                    logger.info(f"Cached {len(result.data)} sources from source_catalog (TTL={self._CACHE_TTL_SECONDS}s)")
+                else:
+                    self._source_catalog_cache = []
+                    self._source_catalog_cache_time = current_time
+                    logger.warning("source_catalog table is empty")
+            except Exception as e:
+                # On error, keep old cache if available, otherwise empty list
+                if self._source_catalog_cache is None:
+                    self._source_catalog_cache = []
+                logger.error(f"Failed to refresh source_catalog cache, using stale data: {e}")
+        else:
+            logger.debug(f"Using cached source_catalog ({len(self._source_catalog_cache)} sources)")
+        
+        return self._source_catalog_cache
+    
+    def invalidate_source_catalog_cache(self):
+        """Manually invalidate source_catalog cache"""
+        self._source_catalog_cache = None
+        self._source_catalog_cache_time = None
+        logger.debug("source_catalog cache invalidated manually")
+    
+    # === DISCOVERED SOURCES MANAGEMENT ===
+    
+    def get_or_create_discovered_source(self, domain: str, language: str = 'fr', 
+                                       geographic_scope: str = 'paris') -> Optional[str]:
+        """Get discovered_source_id for domain, create if doesn't exist"""
+        try:
+            # Clean domain 
+            domain = domain.lower().replace('www.', '')
+            
+            # Try to find existing discovered source
+            result = self.client.table('discovered_sources').select('id').eq('domain', domain).execute()
+            
+            if result.data:
+                return result.data[0]['id']
+            
+            # Create new discovered source
+            source_data = {
+                'domain': domain,
+                'language': language,
+                'geographic_scope': geographic_scope,
+                'auto_authority_weight': 0.4  # Default for discovered sources
+            }
+            
+            result = self.client.table('discovered_sources').insert(source_data).execute()
+            if result.data:
+                discovered_id = result.data[0]['id']
+                logger.info(f"🆕 DISCOVERED SOURCE: {domain} → created with id={discovered_id}")
+                return discovered_id
+                
+        except Exception as e:
+            logger.error(f"Error managing discovered source {domain}: {e}")
+            
+        return None
+    
+    def resolve_source_type(self, domain: str) -> Dict[str, Any]:
+        """Determine if domain is cataloged or discovered, return appropriate reference"""
+        # Handle full URLs by extracting domain
+        if '://' in domain:
+            from urllib.parse import urlparse
+            try:
+                domain = urlparse(domain).netloc.lower()
+            except:
+                pass
+        
+        # Remove www. prefix
+        domain = domain.lower().replace('www.', '')
+        
+        # First check if it's in official catalog
+        cataloged_source_id = self._find_cataloged_source(domain)
+        if cataloged_source_id:
+            return {
+                'type': 'cataloged',
+                'source_id': cataloged_source_id,
+                'discovered_source_id': None,
+                'domain': domain
+            }
+        
+        # Not cataloged, treat as discovered
+        discovered_id = self.get_or_create_discovered_source(domain)
+        return {
+            'type': 'discovered', 
+            'source_id': None,
+            'discovered_source_id': discovered_id,
+            'domain': domain
+        }
+    
+    def _find_cataloged_source(self, domain: str) -> Optional[str]:
+        """Find source_id in official catalog for exact domain match"""
+        sources = self._load_source_catalog()
+        
+        # Try exact match first
+        for source in sources:
+            base_url = source.get('base_url', '')
+            if base_url:
+                try:
+                    from urllib.parse import urlparse
+                    catalog_domain = urlparse(base_url).netloc.lower().replace('www.', '')
+                    if domain == catalog_domain:
+                        return source.get('source_id')
+                except:
+                    continue
+        
+        # Try partial matches for subdomains
+        for source in sources:
+            base_url = source.get('base_url', '')
+            if base_url:
+                try:
+                    from urllib.parse import urlparse
+                    catalog_domain = urlparse(base_url).netloc.lower().replace('www.', '')
+                    if domain.endswith(catalog_domain) or catalog_domain.endswith(domain):
+                        return source.get('source_id')
+                except:
+                    continue
+        
+        return None
+    
+    def get_source_id_from_domain(self, domain: str) -> Optional[str]:
+        """Get source_id from domain using source_catalog database"""
+        # Handle full URLs by extracting domain
+        if '://' in domain:
+            from urllib.parse import urlparse
+            try:
+                domain = urlparse(domain).netloc.lower()
+            except:
+                pass
+        
+        # Remove www. prefix and clean up
+        domain = domain.lower().replace('www.', '')
+        
+        # Load source catalog from DB
+        sources = self._load_source_catalog()
+        
+        # Try exact match first
+        for source in sources:
+            base_url = source.get('base_url', '')
+            if base_url:
+                try:
+                    from urllib.parse import urlparse
+                    catalog_domain = urlparse(base_url).netloc.lower().replace('www.', '')
+                    if domain == catalog_domain:
+                        return source.get('source_id')
+                except:
+                    continue
+        
+        # Try partial matches for subdomains
+        for source in sources:
+            base_url = source.get('base_url', '')
+            if base_url:
+                try:
+                    from urllib.parse import urlparse
+                    catalog_domain = urlparse(base_url).netloc.lower().replace('www.', '')
+                    if domain.endswith(catalog_domain) or catalog_domain.endswith(domain):
+                        return source.get('source_id')
+                except:
+                    continue
+        
+        # No match found - use generic unknown source (ENUM constraint workaround)
+        return self._handle_unknown_domain(domain)
+    
+    def _handle_unknown_domain(self, domain: str) -> str:
+        """
+        Handle unknown domain with ENUM constraint workaround
+        
+        Strategy:
+        1. Use existing 'unknown' source_id if available
+        2. Log domain for future catalog expansion  
+        3. Store domain info in source_mention.domain field for analysis
+        
+        Args:
+            domain: Domain to handle (e.g., 'septime-charonne.fr')
+            
+        Returns:
+            str: Valid source_id from existing ENUM
+        """
+        # Check if we have an 'unknown' or generic source_id in catalog
+        sources = self._load_source_catalog()
+        
+        # Look for dedicated unknown/generic source
+        for source in sources:
+            source_type = source.get('type', '').lower() 
+            if source_type in ['unknown', 'generic', 'other']:
+                logger.info(f"🔍 UNKNOWN DOMAIN: '{domain}' → using generic source_id: {source.get('source_id')}")
+                return source.get('source_id')
+        
+        # Fallback to lowest authority press source for unknown domains
+        press_sources = [(s.get('source_id'), s.get('authority_weight', 1.0)) 
+                        for s in sources if s.get('type', '').lower() == 'press']
+        
+        if press_sources:
+            # Use the press source with lowest authority
+            lowest_authority_source = min(press_sources, key=lambda x: x[1])
+            source_id = lowest_authority_source[0]
+            logger.info(f"🔍 UNKNOWN DOMAIN: '{domain}' → using lowest-authority press: {source_id} (auth={lowest_authority_source[1]})")
+            return source_id
+        
+        # Ultimate fallback - use any available source (this shouldn't happen in well-configured system)
+        if sources:
+            fallback_source = sources[0].get('source_id')
+            logger.warning(f"🚨 UNKNOWN DOMAIN: '{domain}' → emergency fallback: {fallback_source}")
+            return fallback_source
+        
+        # No sources available - should not happen
+        logger.error(f"No sources available in catalog for unknown domain: {domain}")
+        return None
+    
+    
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+    def upsert_source_mention(self, poi_id: str, source_id: str, url: str, excerpt: str, 
+                             title: str, domain: str, query: str, serp_position: int,
+                             final_score: float, score_components: dict) -> bool:
+        """
+        Upsert a source mention (OPTIMIZED: no duplication - type/authority_weight from source_catalog FK)
+        
+        Args:
+            poi_id: POI UUID
+            source_id: Source identifier from source_catalog (FK - type/authority_weight via JOIN)
+            url: Final URL of the mention
+            excerpt: Snippet text from SERP
+            title: Page title from SERP
+            domain: Domain extracted from URL
+            query: Search query that found this result
+            serp_position: Position in SERP results
+            final_score: Final matching score
+            score_components: Breakdown of scoring components
+            
+        Returns:
+            bool: Success status
+        """
+        try:
+            # Prepare optimized data for upsert (NO duplication - type/authority_weight via FK)
+            mention_data = {
+                'id': str(uuid.uuid4()),  # Generate UUID for required id field
+                'poi_id': poi_id,
+                'source_id': source_id,  # FK to source_catalog (type/authority_weight via JOIN)
+                'url': url[:500] if url else None,  # Truncate to schema limit
+                'excerpt': excerpt[:180] if excerpt else None,  # Truncate to schema limit
+                'title': title[:200] if title else None,  # Reasonable title limit
+                'domain': domain[:100] if domain else None,
+                'query': query[:300] if query else None,
+                'serp_position': serp_position if serp_position is not None else None,
+                'final_score': final_score if final_score is not None else None,
+                'score_components': score_components if score_components else None,
+                'accepted': True,  # Only accepted mentions are persisted
+                'last_seen_at': datetime.utcnow().isoformat()
+            }
+            
+            # Try simple insert first (in case table doesn't have the expected constraints)
+            try:
+                result = self.client.table('source_mention').insert(
+                    mention_data
+                ).execute()
+            except Exception as insert_error:
+                # If insert fails (likely due to duplicate), try update based on unique constraint
+                logger.debug(f"Insert failed, attempting update: {insert_error}")
+                try:
+                    result = self.client.table('source_mention')\
+                        .update({
+                            'source_id': mention_data['source_id'],
+                            'excerpt': mention_data['excerpt'],
+                            'final_score': mention_data['final_score'],
+                            'score_components': mention_data['score_components'],
+                            'last_seen_at': mention_data['last_seen_at'],
+                            'title': mention_data['title'],
+                            'domain': mention_data['domain'],
+                            'query': mention_data['query'],
+                            'serp_position': mention_data['serp_position']
+                        })\
+                        .eq('poi_id', mention_data['poi_id'])\
+                        .eq('url', mention_data['url'])\
+                        .execute()
+                except Exception as update_error:
+                    logger.error(f"Both insert and update failed: insert={insert_error}, update={update_error}")
+                    raise update_error
+            
+            # Success is indicated by no exception, even if no data returned
+            # UPDATE operations often don't return data when updating existing records
+            logger.info(f"💾 DB UPSERT: poi={poi_id[:8]}, domain={source_id}, url={url[:50]}...")
+            return True
+                
+        except Exception as e:
+            logger.error(f"Error upserting source_mention for POI {poi_id}: {e}")
+            raise
+
+    def upsert_source_mention_new(self, poi_id: str, url: str, excerpt: str, title: str, domain: str, 
+                                 query: str, serp_position: int, final_score: float, score_components: dict,
+                                 source_id: str = None, discovered_source_id: str = None) -> bool:
+        """
+        Upsert source mention supporting both cataloged sources and discovered sources
+        
+        Args:
+            poi_id: POI UUID
+            url: Final URL of the mention
+            excerpt, title, domain, query, serp_position, final_score, score_components: Mention data
+            source_id: Source identifier from source_catalog (for cataloged sources)
+            discovered_source_id: Discovered source ID (for non-cataloged sources)
+            
+        Note: Exactly one of source_id OR discovered_source_id must be provided
+        """
+        if not ((source_id is None) ^ (discovered_source_id is None)):
+            raise ValueError("Exactly one of source_id or discovered_source_id must be provided")
+            
+        try:
+            mention_data = {
+                'id': str(uuid.uuid4()),
+                'poi_id': poi_id,
+                'url': url[:500] if url else None,
+                'excerpt': excerpt[:180] if excerpt else None, 
+                'title': title[:200] if title else None,
+                'domain': domain[:100] if domain else None,
+                'query': query[:300] if query else None,
+                'serp_position': serp_position if serp_position is not None else None,
+                'final_score': final_score if final_score is not None else None,
+                'score_components': score_components if score_components else None,
+                'accepted': True,
+                'last_seen_at': datetime.utcnow().isoformat()
+            }
+            
+            # Add the appropriate source reference
+            if source_id:
+                mention_data['source_id'] = source_id
+                source_label = f"cataloged:{source_id}"
+            else:
+                mention_data['discovered_source_id'] = discovered_source_id
+                source_label = f"discovered:{discovered_source_id[:8]}"
+            
+            # Try insert first
+            try:
+                result = self.client.table('source_mention').insert(mention_data).execute()
+                logger.info(f"💾 DB INSERT: poi={poi_id[:8]}, source={source_label}, url={url[:50]}...")
+            except Exception as insert_error:
+                # Insert failed, try update
+                logger.debug(f"Insert failed, attempting update: {insert_error}")
+                
+                update_data = {
+                    'excerpt': mention_data['excerpt'],
+                    'final_score': mention_data['final_score'], 
+                    'score_components': mention_data['score_components'],
+                    'last_seen_at': mention_data['last_seen_at'],
+                    'title': mention_data['title'],
+                    'domain': mention_data['domain'],
+                    'query': mention_data['query'],
+                    'serp_position': mention_data['serp_position']
+                }
+                
+                if source_id:
+                    update_data['source_id'] = source_id
+                else:
+                    update_data['discovered_source_id'] = discovered_source_id
+                
+                result = self.client.table('source_mention')\
+                    .update(update_data)\
+                    .eq('poi_id', mention_data['poi_id'])\
+                    .eq('url', mention_data['url'])\
+                    .execute()
+                    
+                logger.info(f"💾 DB UPDATE: poi={poi_id[:8]}, source={source_label}, url={url[:50]}...")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error upserting source_mention: {e}")
+            raise
+    
+    def upsert_source_mentions_batch(self, mentions: List[Dict[str, Any]]) -> int:
+        """
+        Batch upsert multiple source mentions
+        
+        Args:
+            mentions: List of mention dicts with required fields
+            
+        Returns:
+            int: Number of successfully processed mentions
+        """
+        if not mentions:
+            return 0
+        
+        try:
+            # Prepare all mentions for batch upsert
+            prepared_mentions = []
+            for mention in mentions:
+                mention_data = {
+                    'poi_id': mention['poi_id'],
+                    'source_id': mention['source_id'], 
+                    'type': mention.get('type', 'mention'),
+                    'url': mention['url'][:500] if mention.get('url') else None,
+                    'excerpt': mention['excerpt'][:180] if mention.get('excerpt') else None,
+                    'authority_weight': max(0.0, min(1.0, mention.get('authority_weight', 0.5))),
+                    'last_seen_at': datetime.utcnow().isoformat()
+                }
+                prepared_mentions.append(mention_data)
+            
+            # Execute batch upsert
+            result = self.client.table('source_mention').upsert(
+                prepared_mentions,
+                on_conflict='poi_id,source_id'
+            ).execute()
+            
+            count = len(result.data) if result.data else 0
+            logger.info(f"💾 DB BATCH UPSERT: {count}/{len(mentions)} source_mentions processed")
+            return count
+            
+        except Exception as e:
+            logger.error(f"Error batch upserting source_mentions: {e}")
+            raise
+    
+    def get_source_mentions_for_poi(self, poi_id: str) -> List[Dict[str, Any]]:
+        """Get all source mentions for a POI"""
+        try:
+            result = self.client.table('source_mention')\
+                .select('*')\
+                .eq('poi_id', poi_id)\
+                .order('last_seen_at', desc=True)\
+                .execute()
+            
+            return result.data or []
+        except Exception as e:
+            logger.error(f"Error getting source mentions for POI {poi_id}: {e}")
+            return []
+
     # =============================================================================
     # ORCHESTRATOR SUPPORT METHODS
     # =============================================================================

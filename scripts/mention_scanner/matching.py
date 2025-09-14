@@ -20,13 +20,52 @@ def _normalize_core(text: str) -> str:
     """Core text normalization - single source of truth"""
     if not text:
         return ""
-    # Remove accents
+    
+    # Remove accents (NFD normalization)
     text = unicodedata.normalize('NFD', text)
     text = ''.join(c for c in text if unicodedata.category(c) != 'Mn')
+    
+    # Handle common variations before punctuation removal
+    text = _handle_text_variations(text)
+    
     # Remove punctuation and normalize spaces
     text = RE_PUNCTUATION_CLEANUP.sub(' ', text)
     text = RE_WHITESPACE_NORMALIZE.sub(' ', text)
     return text.lower().strip()
+
+def _handle_text_variations(text: str) -> str:
+    """Handle common text variations that affect matching"""
+    # Convert to lowercase for processing
+    text = text.lower()
+    
+    # Common substitutions
+    variations = [
+        # Apostrophes variations
+        ("'", "'"),  # Typographic apostrophe to ASCII  
+        ("'", ""),   # Remove apostrophes entirely for matching
+        ("`", ""),   # Remove backticks
+        
+        # Café variations
+        ("café", "cafe"),  # Normalize café to cafe
+        ("cafés", "cafes"),
+        
+        # Common ligatures and special characters
+        ("œ", "oe"),  # Cœur → coeur
+        ("æ", "ae"),  # Æ → ae
+        
+        # Ampersand variations
+        (" & ", " and "),
+        ("&", "and"),
+        
+        # Common abbreviations
+        (" st ", " saint "),
+        (" ste ", " sainte "),
+    ]
+    
+    for old, new in variations:
+        text = text.replace(old, new)
+    
+    return text
 
 def normalize(text: str) -> str:
     """Normalize text: lowercase, strip accents/punct, collapse spaces"""
@@ -134,12 +173,8 @@ class MentionMatcher:
         # Combined match score
         match_score = 0.6 * trigram_score + 0.3 * geo_score + 0.1 * token_score
         
-        # Acceptance rules
-        accepted = False
-        if match_score >= high_threshold:
-            accepted = True
-        elif match_score >= mid_threshold and (not token_required or has_discriminant):
-            accepted = True
+        # Pass all candidates to intelligent scoring (no early rejection based on match_score)
+        accepted = True
         
         # Debug logging when SCAN_DEBUG=1
         import os

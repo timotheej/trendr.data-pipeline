@@ -74,8 +74,9 @@ class TrendrPipelineOrchestrator:
         merged['dry_run'] = args.dry_run
         merged['fields'] = args.fields
         merged['serp_only'] = args.serp_only
-        merged['cse_num'] = min(args.cse_num, 10)  # Cap at 10
+        merged['cse_num'] = args.cse_num  # No cap limit
         merged['explain'] = args.explain
+        merged['debug'] = args.debug
         
         # sources optionnelles depuis config (neutre si absent)
         merged['sources'] = (self.config.get('social_proof_config', {}) or {}).get('sources')
@@ -332,16 +333,25 @@ class TrendrPipelineOrchestrator:
     def run_seed_mention_scan(self, poi_id: Optional[str], poi_name: Optional[str]) -> bool:
         """Run mention scanner for the seeded POI"""
         city = (self.merged_params['seed_city'] or 'paris').lower()
+        
+        # Use balanced mode from config, fallback to balanced if not specified
+        mention_config = self.config.get('mention_scanner', {})
+        scan_mode = mention_config.get('mode', 'balanced')
+        if self.merged_params.get('serp_only'):
+            scan_mode = 'serp-only'
+        
         cmd = ['python3','-m','scripts.mention_scanner',
-                '--mode','serp-only' if self.merged_params.get('serp_only') else 'open',
+                '--mode', scan_mode,
                 '--city-slug', city,
-                '--limit-per-poi','1',
-                '--cse-num', str(self.merged_params.get('cse_num',10))]
-        if (self.config.get('social_proof_config') or {}).get('sources'):
+                '--cse-num', str(self.merged_params.get('cse_num',50))]
+        
+        # Add sources ONLY for serp-only mode
+        # balanced mode uses source_catalog automatically, don't override with manual sources
+        if scan_mode == 'serp-only' and (self.config.get('social_proof_config') or {}).get('sources'):
             cmd += ['--sources', ','.join(self.config['social_proof_config']['sources'])]
         
-        # Debug extras
-        debug_mode = (logger.level == logging.DEBUG) or os.getenv("SCAN_DEBUG") == "1"
+        # Debug extras - always enable for seed pipeline to get visibility
+        debug_mode = (logger.level == logging.DEBUG) or os.getenv("SCAN_DEBUG") == "1" or self.merged_params.get('debug', False)
         if debug_mode:
             cmd += [
                 '--debug',
@@ -469,14 +479,26 @@ class TrendrPipelineOrchestrator:
     
     def run_mentions_step(self, city: str) -> bool:
         """Run mentions scanning step"""
+        # Use balanced mode from config, fallback to balanced if not specified
+        mention_config = self.config.get('mention_scanner', {})
+        scan_mode = mention_config.get('mode', 'balanced')
+        if self.merged_params.get('serp_only'):
+            scan_mode = 'serp-only'
+            
         cmd = ['python3','-m','scripts.mention_scanner',
-                '--mode','serp-only' if self.merged_params.get('serp_only') else 'open',
+                '--mode', scan_mode,
                 '--city-slug', city.lower(),
-                '--limit-per-poi', str(self.merged_params['batch_size']),
-                '--cse-num', str(self.merged_params.get('cse_num',10))]
-        if (self.config.get('social_proof_config') or {}).get('sources'):
+                '--cse-num', str(self.merged_params.get('cse_num',50))]
+        
+        # Add sources ONLY for serp-only mode
+        # balanced mode uses source_catalog automatically, don't override with manual sources
+        if scan_mode == 'serp-only' and (self.config.get('social_proof_config') or {}).get('sources'):
             cmd += ['--sources', ','.join(self.config['social_proof_config']['sources'])]
-        if logger.level == logging.DEBUG: cmd.append('--debug')
+            
+        # Debug options
+        debug_mode = (logger.level == logging.DEBUG) or self.merged_params.get('debug', False)
+        if debug_mode:
+            cmd += ['--debug', '--log-drop-reasons']
             
         return self.run_subprocess(cmd, 'MENTIONS')
     
@@ -617,10 +639,13 @@ Seed Pipeline (SEED → SCAN):
     
     # Mentions-specific arguments  
     parser.add_argument('--serp-only', action='store_true', help='Use only SERP API for mentions')
-    parser.add_argument('--cse-num', type=int, default=10, help='Number of CSE results (max 10)')
+    parser.add_argument('--cse-num', type=int, default=50, help='Number of CSE results (default 50, no max limit)')
     
     # Classification-specific arguments
     parser.add_argument('--explain', action='store_true', help='Show detailed score components in classification')
+    
+    # Debug arguments
+    parser.add_argument('--debug', action='store_true', help='Enable debug mode with detailed logging and output files')
     
     # Seed POI arguments for chained SEED → SCAN pipeline
     seed_group = parser.add_mutually_exclusive_group()

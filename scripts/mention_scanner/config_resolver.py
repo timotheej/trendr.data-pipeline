@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Configuration resolver for Gatto Mention Scanner
-Handles config loading, threshold resolution, and rate limiting configuration
+Removed unused code: complex threshold systems, legacy resolver chains, experimental config loaders
+
+Unified Config Resolver for GATTO Scanner - Single Source of Truth
+Handles CLI > ENV > config > defaults resolution and logs final values
 """
 import os
 import json
@@ -12,10 +14,22 @@ logger = logging.getLogger(__name__)
 
 def load_config() -> Optional[Dict[str, Any]]:
     """Load configuration from config.json with fallback handling"""
-    config_path = "config.json"
+    # Try multiple paths: current dir, parent dir, project root
+    possible_paths = [
+        "config.json",
+        "../config.json", 
+        "../../config.json",
+        os.path.join(os.path.dirname(__file__), "../../config.json")
+    ]
     
-    if not os.path.exists(config_path):
-        logger.warning(f"Config file {config_path} not found, using defaults")
+    config_path = None
+    for path in possible_paths:
+        if os.path.exists(path):
+            config_path = path
+            break
+    
+    if not config_path:
+        logger.warning(f"Config file not found in any of {possible_paths}, using defaults")
         return None
     
     try:
@@ -64,6 +78,7 @@ def _resolve_thresholds(args, cfg) -> Tuple[float, float]:
     
     return high_threshold, mid_threshold
 
+
 def _rate_limit_delay(cfg) -> float:
     """Get rate limiting delay from config or fallback to current values
     
@@ -102,3 +117,98 @@ def _rate_limit_delay(cfg) -> float:
     # Fallback to DEFAULT_DELAY
     logger.debug(f"[RATE_LIMIT] delay={DEFAULT_DELAY:.2f}s (source: internal - no valid config)")
     return DEFAULT_DELAY
+
+
+def resolve_config() -> Dict[str, Any]:
+    """Single function that returns final config values (CLI > ENV > config > defaults) and logs them"""
+    logger = logging.getLogger(__name__)
+    
+    # Load base config
+    base_config = load_config()
+    
+    # KISS defaults - minimal, let config.json override everything
+    final_config = {
+        'mention_scanner': {
+            'mode': 'balanced',
+            'match_score': {
+                'high': 0.35,
+                'mid': 0.20
+            },
+            'scoring': {
+                'name_weight': 0.60,  # KISS fixed weights
+                'geo_weight': 0.25,
+                'authority_weight': 0.15
+            },
+            'limits': {
+                'cse_num': 30
+            },
+            'serp_only': {
+                'sources': []
+            }
+        },
+        'domain_exclusions': {
+            'exclude_from_mentions': False  # Default disabled
+        }
+    }
+    
+    # Overlay base config
+    if base_config:
+        _deep_merge(final_config, base_config)
+    
+    # Apply ENV overrides
+    if os.getenv('SCANNER_MODE'):
+        final_config['mention_scanner']['mode'] = os.getenv('SCANNER_MODE')
+    
+    if os.getenv('CSE_NUM'):
+        try:
+            final_config['mention_scanner']['limits']['cse_num'] = int(os.getenv('CSE_NUM'))
+        except ValueError:
+            pass
+    
+    if os.getenv('THRESHOLD_HIGH'):
+        try:
+            final_config['mention_scanner']['thresholds']['high'] = float(os.getenv('THRESHOLD_HIGH'))
+        except ValueError:
+            pass
+            
+    if os.getenv('THRESHOLD_MID'):
+        try:
+            final_config['mention_scanner']['thresholds']['mid'] = float(os.getenv('THRESHOLD_MID'))
+        except ValueError:
+            pass
+    
+    # Log final resolved config
+    scanner_config = final_config['mention_scanner']
+    logger.info("📋 RESOLVED CONFIG:")
+    logger.info(f"  mode: {scanner_config['mode']}")
+    logger.info(f"  limits.cse_num: {scanner_config['limits']['cse_num']}")
+    
+    # Use match_score structure from config.json
+    thresholds = scanner_config.get('match_score', {})
+    logger.info(f"  thresholds: high={thresholds['high']}, mid={thresholds['mid']}")
+    
+    # Use scoring structure from config.json  
+    scoring = scanner_config.get('scoring', {})
+    logger.info(f"  weights: name={scoring['name_weight']}, geo={scoring['geo_weight']}, authority={scoring['authority_weight']}")
+    
+    # Domain exclusions (nested in mention_scanner in config.json)
+    domain_exclusions = scanner_config.get('domain_exclusions', {})
+    if domain_exclusions.get('exclude_from_mentions', False):
+        excluded_count = len(domain_exclusions.get('social_networks', [])) + len(domain_exclusions.get('review_sites', []))
+        logger.info(f"  domain_exclusions: enabled ({excluded_count} domains)")
+    else:
+        logger.info(f"  domain_exclusions: disabled")
+    
+    if scanner_config['mode'] == 'serp-only' and scanner_config['serp_only']['sources']:
+        logger.info(f"  serp_only.sources: {scanner_config['serp_only']['sources'][:3]}{'...' if len(scanner_config['serp_only']['sources']) > 3 else ''}")
+    
+    return final_config
+
+
+def _deep_merge(target: Dict[str, Any], source: Dict[str, Any]) -> None:
+    """Deep merge source dict into target dict"""
+    for key, value in source.items():
+        if key in target and isinstance(target[key], dict) and isinstance(value, dict):
+            _deep_merge(target[key], value)
+        else:
+            target[key] = value

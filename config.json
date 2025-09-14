@@ -3,7 +3,7 @@
     "cities": ["Paris"],
     "poi_categories": [
       "restaurant",
-      "cafe", 
+      "cafe",
       "bar",
       "tourist_attraction",
       "shopping_mall",
@@ -23,7 +23,7 @@
     "photo_batch_limit": 20,
     "incremental_mode": true
   },
-  
+
   "ingestion_config": {
     "comprehensive_search": true,
     "max_queries_per_category": 10,
@@ -31,26 +31,39 @@
     "neighborhood_specific_search": true,
     "enhanced_details": true
   },
-  
+
   "social_proof_config": {
     "max_queries_per_poi": 3,
     "cache_enabled": true,
     "cache_ttl_hours": 48,
     "authority_threshold": 0.3,
     "min_proof_sources": 1,
-    "sources": [
-      "lefooding.com",
-      "timeout.fr",
-      "sortiraparis.com"
-    ]
+    "sources": ["lefooding.com", "timeout.fr", "sortiraparis.com"]
   },
 
   "mention_scanner": {
     "mode": "balanced",
     "match_score": {
-      "high": 0.92,
-      "mid": 0.85,
-      "low": 0.78
+      "high": 0.35,
+      "mid": 0.20
+    },
+    "scoring": {
+      "name_weight": 0.5,
+      "geo_weight": 0.2,
+      "cat_weight": 0.15,
+      "authority_weight": 0.15,
+      "max_penalty": 0.4
+    },
+    "geo_scoring": {
+      "city_name_score": 0.4,
+      "postal_code_score": 0.3,
+      "admin_region_score": 0.2,
+      "country_score": 0.1,
+      "url_city_segment_score": 0.3,
+      "distance_full_score": 0.3,
+      "distance_half_score": 0.15,
+      "distance_full_threshold_km": 3,
+      "distance_half_threshold_km": 15
     },
     "limits": {
       "poi_limit": 10,
@@ -70,7 +83,9 @@
       }
     },
     "dedup": {
-      "window_days": 21
+      "window_days": 21,
+      "max_per_window": 3,
+      "intelligent_multi_language": true
     },
     "name_match": {
       "max_levenshtein": 2,
@@ -78,48 +93,109 @@
       "allow_arrondissement_tokens": true
     },
     "acceptance_rules": {
-      "title_has_poi_name_boost": 0.10,
+      "title_has_poi_name_boost": 0.1,
       "url_has_poi_name_boost": 0.05,
       "authority_weight_threshold": 0.65,
       "min_distinct_sources": 1
     },
+    "intelligent_acceptance": {
+      "name_threshold": 0.5,
+      "geo_threshold": 0.5,
+      "authority_threshold": 0.7,
+      "high_authority_threshold": 0.9,
+      "min_geo_for_mid": 0.4,
+      "min_authority_for_mid": 0.7
+    },
     "domain_groups": {
-      "press": { "weight": 0.70 },
+      "press": { "weight": 0.7 },
       "guide": { "weight": 0.85 },
-      "blog": { "weight": 0.60 },
-      "local": { "weight": 0.50 },
+      "blog": { "weight": 0.6 },
+      "local": { "weight": 0.5 },
       "reviews": { "weight": 0.45 }
     },
     "logging": {
       "jsonl": false,
       "log_drop_reasons": true
     },
+    "debug_mode": {
+      "threshold_high": 0.3,
+      "threshold_mid": 0.15,
+      "token_required_for_mid": false
+    },
+    "domain_exclusions": {
+      "social_networks": [
+        "instagram.com",
+        "facebook.com",
+        "tiktok.com",
+        "snapchat.com",
+        "twitter.com",
+        "x.com",
+        "linkedin.com",
+        "youtube.com"
+      ],
+      "review_sites": [
+        "tripadvisor.com",
+        "tripadvisor.fr",
+        "tripadvisor.co.uk",
+        "yelp.com",
+        "yelp.fr",
+        "booking.com",
+        "expedia.com",
+        "hotels.com",
+        "kayak.com",
+        "opentable.com",
+        "zomato.com"
+      ],
+      "exclude_from_mentions": true
+    },
     "query_strategy": {
       "mode": "poi_strict",
       "use_generic_topic_queries": false,
-      "geo_hints": ["Paris", "750", "1er", "2e", "3e", "4e", "5e", "6e", "7e", "8e", "9e", "10e", "11e", "12e", "13e", "14e", "15e", "16e", "17e", "18e", "19e", "20e"],
+      "geo_hints": [
+        "Paris",
+        "750",
+        "1er",
+        "2e",
+        "3e",
+        "4e",
+        "5e",
+        "6e",
+        "7e",
+        "8e",
+        "9e",
+        "10e",
+        "11e",
+        "12e",
+        "13e",
+        "14e",
+        "15e",
+        "16e",
+        "17e",
+        "18e",
+        "19e",
+        "20e"
+      ],
       "category_synonyms": {
         "bar": ["bar à cocktails", "cocktail bar", "bar"],
         "cafe": ["café", "coffee shop", "coffee"],
         "restaurant": ["restaurant", "bistrot", "brasserie"]
       },
       "templates": [
-        "site:{domain} \"{poi_name}\"",
-        "site:{domain} \"{poi_name_normalized}\"",
-        "site:{domain} \"{poi_name} {geo_hint}\"",
-        "site:{domain} \"{poi_name}\" {category_synonym}"
+        "{multi_site_query} \"{poi_name} {category_synonym} {city_name}\""
       ],
-      "global_templates": [
-        "\"{poi_name}\" Paris",
-        "\"{poi_name_normalized}\" Paris"
-      ],
-      "max_templates_per_poi": 6
+      "global_templates": ["\"{poi_name}\" {category_synonym} {city_name}"],
+      "max_templates_per_poi": 25
     }
   },
-  
+
   "api_cost_optimization": {
     "use_basic_fields_only": true,
-    "avoid_expensive_fields": ["photos", "reviews", "opening_hours", "formatted_phone_number"],
+    "avoid_expensive_fields": [
+      "photos",
+      "reviews",
+      "opening_hours",
+      "formatted_phone_number"
+    ],
     "optimized_fields": "place_id,name,formatted_address,geometry,types,rating,user_ratings_total,website,price_level",
     "batch_place_details": true,
     "cache_place_details": 168,
@@ -135,7 +211,7 @@
       "update_interval_multiplier": 2.0
     }
   },
-  
+
   "classification_config": {
     "contextual_tags_enabled": true,
     "min_tag_confidence": 0.4,
@@ -146,7 +222,7 @@
       "hidden_gem": ["hidden", "gem", "secret", "local", "authentic"]
     }
   },
-  
+
   "deployment_config": {
     "environment": "production",
     "log_level": "INFO",

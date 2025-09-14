@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """
-Scoring utilities for Gatto Mention Scanner
-Handles scoring calculations, acceptability checks, and candidate comparison
+Removed unused code: complex weighted systems, legacy matcher_scores, experimental algorithms
+
+KISS Scoring System for GATTO Scanner - Fixed weights: 0.60*name + 0.25*geo + 0.15*authority
+Simple penalty system with country/city mismatch detection
 """
 import re
 import math
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
-from typing import Dict, Any, Optional, Tuple, Union
+from typing import Dict, Any, Optional, Tuple, Union, List
 import logging
 
-# Try to import domains and matching to avoid circular imports
+# Try to import domains, matching, and city_profiles to avoid circular imports
 try:
     from .domains import domain_of
     from .matching import normalize
+    from .city_profiles import city_manager
 except ImportError:
     try:
         from domains import domain_of
         from matching import normalize
+        from city_profiles import city_manager
     except ImportError:
         # Fallback - will need to import these functions when used
         pass
@@ -25,97 +29,30 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-# Pre-compiled regex patterns for geo scoring
-RE_ARRONDISSEMENT = re.compile(r'\b(1er|2e|3e|4e|5e|6e|7e|8e|9e|10e|11e|12e|13e|14e|15e|16e|17e|18e|19e|20e)\b')
-RE_ARRONDISSEMENT_WORD = re.compile(r'\barrondissement\b')
-RE_PARIS_POSTAL = re.compile(r'\b750\d{2}\b')
-RE_FRANCE_INDICATORS = re.compile(r'\bfrance\b|\bfr\b')
+# KISS - removed legacy regex patterns, time_decay, fuzzy_score functions
 
-def time_decay(published_at_iso: Optional[str], config: Optional[Dict[str, Any]] = None) -> float:
-    """Calculate time decay weight using exponential decay"""
-    if not published_at_iso:
-        return 1.0  # No penalty if no date
-    
-    # Get decay parameters from config with fallbacks
-    decay_config = {}
-    if config and 'mention_scanner' in config:
-        decay_config = config['mention_scanner'].get('decay', {})
-    
-    half_life_days = decay_config.get('half_life_days', 30)
-    floor_value = decay_config.get('floor', 0.1)
-    
-    try:
-        # Parse ISO datetime
-        if published_at_iso.endswith('Z'):
-            published_at_iso = published_at_iso[:-1] + '+00:00'
-        published_at = datetime.fromisoformat(published_at_iso)
-        if published_at.tzinfo is None:
-            published_at = published_at.replace(tzinfo=timezone.utc)
-        
-        # Calculate age in days
-        now_utc = datetime.now(timezone.utc)
-        delta_days = (now_utc - published_at).days
-        
-        # Exponential decay with half-life: w_time = exp(-ln(2)*Δ/τ)
-        decay_constant = math.log(2) / half_life_days
-        w_time = math.exp(-decay_constant * delta_days)
-        return max(floor_value, min(1.0, w_time))
-        
-    except (ValueError, AttributeError):
-        return 1.0
+# KISS - removed calculate_intelligent_name_score, _clean_for_exact_match, _is_exact_match_with_stopwords, name_match_detailed functions
 
-def fuzzy_score(a: str, b: str) -> float:
-    """Calculate fuzzy similarity ratio in [0,1]"""
-    if not a or not b:
-        return 0.0
-    return SequenceMatcher(None, normalize(a), normalize(b)).ratio()
+# KISS - removed geo_hint, geo_hint_detailed, cat_hint functions - use city_manager directly
 
-def geo_hint(title: str, snippet: str, url: str) -> float:
-    """Return 0..1 score based on presence of Paris/France geo indicators"""
-    text = f"{title} {snippet} {url}".lower()
-    score = 0.0
+def calculate_authority(domain: str, config: Optional[Dict[str, Any]] = None, 
+                      db_manager: Optional[Any] = None) -> float:
+    """Calculate authority score using source_catalog.authority_weight (database-driven)"""
+    # If database manager available, use source_catalog
+    if db_manager:
+        try:
+            source_id = db_manager.get_source_id_from_domain(domain)
+            if source_id:
+                # Load source_catalog to get authority_weight
+                sources = db_manager._load_source_catalog()
+                for source in sources:
+                    if source.get('source_id') == source_id:
+                        authority_weight = source.get('authority_weight', 0.5)
+                        return authority_weight
+        except Exception:
+            pass  # Fallback to config/default
     
-    # Paris indicators
-    if 'paris' in text:
-        score += 0.4
-    
-    # Arrondissement indicators 
-    if RE_ARRONDISSEMENT.search(text):
-        score += 0.3
-    elif RE_ARRONDISSEMENT_WORD.search(text):
-        score += 0.2
-    
-    # Postal codes
-    if RE_PARIS_POSTAL.search(text):
-        score += 0.3
-    
-    # France indicators
-    if RE_FRANCE_INDICATORS.search(text):
-        score += 0.1
-    
-    return min(score, 1.0)
-
-def cat_hint(title: str, snippet: str, category: str) -> float:
-    """Lightweight category keyword matching"""
-    text = f"{title} {snippet}".lower()
-    
-    # Category-specific keywords
-    category_keywords = {
-        'restaurant': ['restaurant', 'cuisine', 'chef', 'menu', 'plat', 'gastronomie', 'table'],
-        'bar': ['bar', 'cocktail', 'drink', 'alcool', 'bière', 'vin', 'spiritueux'],
-        'cafe': ['café', 'coffee', 'expresso', 'cappuccino', 'thé', 'petit déjeuner'],
-        'bakery': ['boulangerie', 'pain', 'croissant', 'pâtisserie', 'viennoiserie'],
-        'night_club': ['club', 'dj', 'musique', 'soirée', 'danse', 'nightlife']
-    }
-    
-    keywords = category_keywords.get(category, [])
-    matches = sum(1 for keyword in keywords if keyword in text)
-    
-    return min(matches / max(len(keywords), 1), 1.0)
-
-def calculate_authority(domain: str, config: Optional[Dict[str, Any]] = None) -> float:
-    """Calculate authority score for a domain using domain_groups mapping"""
-    # Get domain groups from config
+    # Legacy fallback: use domain_groups from config  
     domain_groups = {}
     if config and 'mention_scanner' in config:
         domain_groups = config['mention_scanner'].get('domain_groups', {})
@@ -126,50 +63,14 @@ def calculate_authority(domain: str, config: Optional[Dict[str, Any]] = None) ->
     # Return weight from domain_groups or fallback to 0.5
     return domain_groups.get(apex_domain, 0.5)
 
-def calculate_penalties(domain: str, url: str, config: Optional[Dict[str, Any]] = None) -> float:
-    """Calculate penalty score for domain/URL patterns"""
-    penalties = 0.0
-    
-    # Get penalty config with fallbacks
-    penalty_config = {}
-    if config and 'mention_scanner' in config:
-        penalty_config = config['mention_scanner'].get('penalties', {})
-    
-    social_domains = penalty_config.get('social_domains', {
-        'facebook.com', 'twitter.com', 'instagram.com', 'linkedin.com',
-        'youtube.com', 'tiktok.com', 'pinterest.com'
-    })
-    social_penalty = penalty_config.get('social_penalty', 0.15)
-    low_quality_penalty = penalty_config.get('low_quality_penalty', 0.10)
-    url_param_penalty = penalty_config.get('url_param_penalty', 0.05)
-    
-    # Social media penalty
-    if domain in social_domains:
-        penalties += social_penalty
-    
-    # Low-quality domain patterns
-    if any(pattern in domain for pattern in ['blogspot', 'wordpress', 'wix', 'squarespace']):
-        penalties += low_quality_penalty
-    
-    # Suspicious URL patterns
-    if any(pattern in url.lower() for pattern in ['?', '&', '=', '%']):
-        penalties += url_param_penalty
-    
-    return penalties
+# KISS - removed calculate_penalties function - penalties handled in KISS scoring
 
 def final_score(poi_name: str, title: str, snippet: str, url: str, 
-                poi_category: str, config: Optional[Dict[str, Any]] = None, debug: bool = False) -> Union[float, Tuple[float, Dict[str, Any]]]:
-    """Calculate final score combining authority, boosts, and decay
+                poi_category: str, config: Optional[Dict[str, Any]] = None, debug: bool = False,
+                city_slug: str = 'paris', poi_coords: Optional[Tuple[float, float]] = None,
+                db_manager: Optional[Any] = None) -> Union[float, Tuple[float, Dict[str, Any]]]:
+    """KISS final score: fixed weights 0.60*name + 0.25*geo + 0.15*authority
     
-    Args:
-        poi_name: POI name to match against
-        title: Article title
-        snippet: Article snippet
-        url: Article URL
-        poi_category: POI category
-        config: Configuration dict
-        debug: If True, return (score, explain_dict) tuple
-        
     Returns:
         float: Final score (0.0-1.0), or tuple of (score, explain_dict) if debug=True
     """
@@ -180,55 +81,40 @@ def final_score(poi_name: str, title: str, snippet: str, url: str,
     
     domain = domain_of(url)
     
-    # Calculate components
-    authority = calculate_authority(domain, config)
-    name_match = fuzzy_score(poi_name, title + " " + snippet)
-    geo_score = geo_hint(title, snippet, url)
-    cat_score = cat_hint(title, snippet, poi_category)
-    penalties = calculate_penalties(domain, url, config)
+    # Calculate 3 components with KISS approach
+    name_score = _calculate_name_score_kiss(poi_name, title, snippet)
+    geo_score = _calculate_geo_score_kiss(title, snippet, url, city_slug, poi_coords, config, db_manager)
+    authority = calculate_authority(domain, config, db_manager)
     
-    # Get scoring weights from config with fallbacks
-    scoring_config = {}
-    if config and 'mention_scanner' in config:
-        scoring_config = config['mention_scanner'].get('scoring', {})
+    # Apply FIXED weights (KISS requirement)
+    WEIGHTS = {'name': 0.60, 'geo': 0.25, 'authority': 0.15}
     
-    name_weight = scoring_config.get('name_weight', 0.55)
-    geo_weight = scoring_config.get('geo_weight', 0.25)
-    cat_weight = scoring_config.get('cat_weight', 0.05)
-    authority_weight = scoring_config.get('authority_weight', 0.15)
+    weighted_name = WEIGHTS['name'] * name_score
+    weighted_geo = WEIGHTS['geo'] * geo_score  
+    weighted_authority = WEIGHTS['authority'] * authority
     
-    # Apply formula
-    score = (name_weight * name_match + 
-             geo_weight * geo_score + 
-             cat_weight * cat_score + 
-             authority_weight * authority - 
-             penalties)
+    # Base score
+    base_score = weighted_name + weighted_geo + weighted_authority
     
-    final_score_value = max(0.0, min(1.0, score))
+    # Apply penalties (country/city mismatch only)
+    penalties = _calculate_kiss_penalties(poi_name, title, snippet, url, city_slug, config)
+    final_score_value = max(0.0, min(1.0, base_score - penalties['total']))
     
     if debug_enabled:
         explain = {
             'components': {
-                'name_match': round(name_match, 3),
+                'name_match': round(name_score, 3),
                 'geo_score': round(geo_score, 3), 
-                'cat_score': round(cat_score, 3),
                 'authority': round(authority, 3),
-                'penalties': round(penalties, 3)
+                'penalties': penalties
             },
-            'weights': {
-                'name_weight': name_weight,
-                'geo_weight': geo_weight,
-                'cat_weight': cat_weight,
-                'authority_weight': authority_weight
-            },
+            'weights': WEIGHTS,
             'weighted_components': {
-                'name_component': round(name_weight * name_match, 3),
-                'geo_component': round(geo_weight * geo_score, 3),
-                'cat_component': round(cat_weight * cat_score, 3), 
-                'authority_component': round(authority_weight * authority, 3),
-                'penalty_component': round(-penalties, 3)
+                'name_component': round(weighted_name, 3),
+                'geo_component': round(weighted_geo, 3),
+                'authority_component': round(weighted_authority, 3),
             },
-            'raw_score': round(score, 3),
+            'base_score': round(base_score, 3),
             'final_score': round(final_score_value, 3),
             'domain': domain
         }
@@ -236,39 +122,49 @@ def final_score(poi_name: str, title: str, snippet: str, url: str,
     
     return final_score_value
 
-def is_acceptable(candidate: Dict[str, Any], thresholds: Dict[str, float], rules: Dict[str, Any]) -> bool:
-    """Check if candidate meets acceptance criteria using exact current logic"""
-    score = candidate.get('score', 0.0)
-    geo_score = candidate.get('geo_score', 0.0)
-    authority_weight = candidate.get('authority_weight', 0.0)
-    title = candidate.get('title', '')
-    url = candidate.get('url', '')
-    poi_name = candidate.get('poi_name', '')
+def make_tabular_decision(final_score: float, explain: Dict[str, Any], candidate: Dict[str, Any], 
+                         high_threshold: float = 0.35, mid_threshold: float = 0.20) -> Tuple[str, str, List[str]]:
+    """
+    KISS tabular decision logic with clear priority order:
     
-    # Get thresholds
-    high_threshold = thresholds.get('high', 0.82)
-    mid_threshold = thresholds.get('mid', 0.33)
-    authority_threshold = rules.get('authority_weight_threshold', 0.3)
-    min_sources = rules.get('min_distinct_sources', 2)
+    1. Auto-accept confirmed domain (no country alert) → accepted_by=confirmed_domain
+    2. final_score ≥ 0.35 → ACCEPT (accepted_by=score_high) 
+    3. 0.20 ≤ final_score < 0.35 AND (geo≥0.25 OR authority≥0.60) → REVIEW (accepted_by=mid_conditional)
+    4. Otherwise → REJECT
     
-    # Title/URL boost checks
-    title_boost = rules.get('title_has_poi_name_boost', False)
-    url_boost = rules.get('url_has_poi_name_boost', False)
+    Returns: (decision, accepted_by, drop_reasons)
+    """
+    authority = explain['components']['authority']
+    geo_score = explain['components']['geo_score'] 
+    penalties = explain['components']['penalties']
+    drop_reasons = []
     
-    # Current acceptance logic: score >= high AND geo >= mid
-    base_acceptable = score >= high_threshold and geo_score >= mid_threshold
+    # Rule 1: Auto-accept confirmed domain (if no country mismatch)
+    if authority >= 1.0 and penalties.get('country_mismatch', 0) == 0:
+        return "ACCEPT", "confirmed_domain", []
     
-    # Additional rules if configured
-    if authority_threshold and authority_weight < authority_threshold:
-        base_acceptable = False
+    # Check hard rejects first
+    if penalties.get('country_mismatch', 0) > 0:
+        drop_reasons.append("country_mismatch")
+        return "REJECT", "", drop_reasons
     
-    # Apply boosts if configured
-    if title_boost and poi_name.lower() in title.lower():
-        base_acceptable = True
-    if url_boost and poi_name.lower() in url.lower():
-        base_acceptable = True
+    # Rule 2: High score threshold
+    if final_score >= high_threshold:
+        return "ACCEPT", "score_high", []
     
-    return base_acceptable
+    # Rule 3: Mid threshold with conditions
+    if (mid_threshold <= final_score < high_threshold and 
+        (geo_score >= 0.25 or authority >= 0.60)):
+        return "REVIEW", "mid_conditional", []
+    
+    # Rule 4: Reject with reasons
+    if final_score < mid_threshold:
+        drop_reasons.append(f"score_too_low:{final_score:.3f}<{mid_threshold}")
+    else:
+        drop_reasons.append(f"mid_conditions_failed:geo={geo_score:.3f}<0.25 AND auth={authority:.3f}<0.60")
+    
+    return "REJECT", "", drop_reasons
+
 
 def is_better_candidate(candidate1: Dict[str, Any], candidate2: Dict[str, Any], config: Optional[Dict[str, Any]] = None) -> bool:
     """Compare two candidates using stable tie-breaker rules"""
@@ -295,3 +191,142 @@ def is_better_candidate(candidate1: Dict[str, Any], candidate2: Dict[str, Any], 
     domain1 = candidate1.get('domain', '')
     domain2 = candidate2.get('domain', '')
     return domain1 < domain2  # Lexicographically smaller domain wins
+
+
+def _calculate_name_score_kiss(poi_name: str, title: str, snippet: str) -> float:
+    """KISS name scoring: 2 signals (fuzzy + trigram) with simple stopword normalization"""
+    if not poi_name:
+        return 0.0
+        
+    text = f"{title} {snippet}"
+    if not text.strip():
+        return 0.0
+    
+    # Two distinct signals
+    fuzzy_score = SequenceMatcher(None, poi_name.lower(), text.lower()).ratio()
+    trigram_score = _trigram_similarity_kiss(poi_name, text)
+    
+    # Simple stopword normalization boost
+    normalized_text = _remove_stopwords_kiss(text)
+    normalized_poi = _remove_stopwords_kiss(poi_name)
+    
+    if normalized_poi and normalized_text:
+        normalized_fuzzy = SequenceMatcher(None, normalized_poi.lower(), normalized_text.lower()).ratio()
+        fuzzy_score = max(fuzzy_score, normalized_fuzzy)
+    
+    return max(fuzzy_score, trigram_score)
+
+
+def _calculate_geo_score_kiss(title: str, snippet: str, url: str, city_slug: str, poi_coords: Optional[Tuple[float, float]], config: Optional[Dict[str, Any]], db_manager: Optional[Any]) -> float:
+    """KISS geo scoring using city_manager"""
+    try:
+        from .city_profiles import city_manager
+        city_profile = city_manager.get_profile(city_slug)
+        if not city_profile:
+            return 0.0
+        
+        # Extract geo signals using city manager
+        geo_result = city_manager.extract_geo_signals(title, snippet, url, city_profile, poi_coords, config)
+        return geo_result['score']
+        
+    except Exception as e:
+        logger.debug(f"Geo scoring failed: {e}")
+        return 0.0
+
+
+def _trigram_similarity_kiss(a: str, b: str) -> float:
+    """Simple trigram similarity"""
+    if not a or not b:
+        return 0.0
+        
+    def get_trigrams(s):
+        s = f"  {s.lower()}  "  # Padding
+        return set(s[i:i+3] for i in range(len(s)-2))
+    
+    tri_a = get_trigrams(a)
+    tri_b = get_trigrams(b)
+    
+    if not tri_a or not tri_b:
+        return 0.0
+    
+    intersection = len(tri_a & tri_b)
+    union = len(tri_a | tri_b)
+    return intersection / union if union > 0 else 0.0
+
+
+def _remove_stopwords_kiss(text: str) -> str:
+    """Simple stopword removal"""
+    stopwords = {
+        'le', 'la', 'les', 'du', 'de', 'des', 'un', 'une', 'et', 'ou', 
+        'restaurant', 'cafe', 'bar', 'chez', 'aux', 'au', 'paris'
+    }
+    
+    words = text.lower().split()
+    filtered = [w for w in words if w not in stopwords and len(w) > 2]
+    return ' '.join(filtered)
+
+
+def _calculate_kiss_penalties(poi_name: str, title: str, snippet: str, url: str, city_slug: str, config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """KISS penalties: country mismatch (hard reject) + city mismatch (soft penalty)"""
+    penalties = {
+        'country_mismatch': 0.0,
+        'city_mismatch': 0.0, 
+        'total': 0.0
+    }
+    
+    try:
+        from .city_profiles import city_manager
+        city_profile = city_manager.get_profile(city_slug)
+        if not city_profile:
+            return penalties
+            
+        text = f"{title} {snippet} {url}".lower()
+        
+        # Country mismatch (hard reject)
+        expected_country = city_profile.country_code
+        if _detect_wrong_country_kiss(text, expected_country):
+            penalties['country_mismatch'] = 1.0  # Hard reject
+            penalties['total'] = 1.0
+            return penalties
+        
+        # City mismatch (soft penalty)
+        if _detect_wrong_city_kiss(text, city_profile):
+            penalties['city_mismatch'] = 0.15  # -0.15 penalty
+            penalties['total'] = 0.15
+            
+    except Exception as e:
+        logger.debug(f"Penalty calculation failed: {e}")
+    
+    return penalties
+
+
+def _detect_wrong_country_kiss(text: str, expected_country: str) -> bool:
+    """KISS country mismatch detection - only flag obvious conflicts"""
+    # Only check for explicit country mentions, not TLDs (too restrictive)
+    country_indicators = {
+        'FR': [r'\benglish\b', r'\bunited states\b', r'\busa\b', r'\bgermany\b', r'\bspain\b', r'\bitaly\b'],
+        'CA': [r'\bfrance\b', r'\bgermany\b', r'\bspain\b', r'\bitaly\b'],
+        'US': [r'\bfrance\b', r'\bcanada\b', r'\bgermany\b', r'\bspain\b', r'\bitaly\b'],
+        'GB': [r'\bfrance\b', r'\bcanada\b', r'\bgermany\b', r'\bspain\b', r'\bitaly\b'],
+        'DE': [r'\bfrance\b', r'\bcanada\b', r'\busa\b', r'\bspain\b', r'\bitaly\b'],
+        'ES': [r'\bfrance\b', r'\bcanada\b', r'\busa\b', r'\bgermany\b', r'\bitaly\b'],
+        'IT': [r'\bfrance\b', r'\bcanada\b', r'\busa\b', r'\bgermany\b', r'\bspain\b']
+    }
+    
+    # Only flag if explicit conflicting country is mentioned
+    conflicting_patterns = country_indicators.get(expected_country, [])
+    for pattern in conflicting_patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            logger.debug(f"Country mismatch detected: pattern '{pattern}' found for expected country {expected_country}")
+            return True
+    
+    return False
+
+
+def _detect_wrong_city_kiss(text: str, city_profile) -> bool:
+    """Simple city mismatch detection"""
+    competing_cities = getattr(city_profile, 'competing_cities', [])
+    for city in competing_cities:
+        if city.lower() in text:
+            return True
+    return False

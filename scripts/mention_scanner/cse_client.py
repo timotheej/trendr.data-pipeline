@@ -120,12 +120,12 @@ class CSESearcher:
         
         return None
     
-    def search(self, query: str, debug: bool = False, cse_num: int = 10, summary=None, no_cache: bool = False, dump_serp_dir: str = None) -> List[Dict[str, Any]]:
+    def search(self, query: str, debug: bool = False, cse_num: int = 10, summary=None, no_cache: bool = False, dump_serp_dir: str = None, gl: str = 'fr', hl: str = 'fr', cr: str = 'countryFR') -> List[Dict[str, Any]]:
         """Search using Google CSE with persistent caching and retry logic"""
         # Generate cache params for the key format
         start = 1
         num = min(cse_num, 10)  # CSE max is 10
-        cache_params = {'start': start, 'num': num, 'gl': 'fr', 'hl': 'fr'}
+        cache_params = {'start': start, 'num': num, 'gl': gl, 'hl': hl, 'cr': cr}
         
         # Check persistent cache first (unless no_cache is enabled)
         cached_results = None
@@ -144,8 +144,9 @@ class CSESearcher:
             'q': query,
             'num': num,
             'start': start,
-            'gl': 'fr',
-            'hl': 'fr'
+            'gl': gl,
+            'hl': hl,
+            'cr': cr
         }
         
         if debug:

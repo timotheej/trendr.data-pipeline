@@ -1,216 +1,255 @@
-# Gatto Mention Scanner - Documentation
+# GATTO Mention Scanner - KISS Edition
 
-Le Gatto Mention Scanner est un système modulaire de détection et scoring de mentions de POIs (Points d'Intérêt) dans les résultats de recherche.
+KISS (Keep It Simple, Stupid) mention scanner with 3 simplified modes and fixed scoring weights.
+
+## Removed Code
+- Complex weighted systems, legacy matcher_scores, experimental algorithms
+- Strategy-based scanning, complex query builders, legacy match pipelines  
+- Multi-source resolvers, threshold resolution chains, experimental config loaders
 
 ## 📋 Prérequis
 
 Depuis la racine du repository :
+
 ```bash
 export PYTHONPATH="$(pwd)"
+export GOOGLE_CUSTOM_SEARCH_API_KEY="votre_clé_api"
+export GOOGLE_CUSTOM_SEARCH_ENGINE_ID="votre_cx_id"
 ```
 
-## 🎯 Modes de Scanning
+## 3 Modes (Simplified)
 
-### 1. Mode `open` - Recherche Globale
-Effectue des recherches globales sans restriction de domaine.
+### balanced
+Sources: catalogue (toutes sources actives) + CSE (requêtes ouvertes)
+- `collect_from_catalog_active_sources()` + `collect_from_cse()`
 
 ```bash
-python -m scripts.mention_scanner.scanner \
-  --mode open \
-  --poi-name "Le Rigmarole" \
-  --cse-num 10 \
-  --jsonl-out out/mentions.open.jsonl \
-  --debug
+python -m scripts.mention_scanner \
+  --mode balanced \
+  --poi-names "Septime,Le Chateaubriand" \
+  --city-slug paris
 ```
 
-**Caractéristiques :**
-- **Requêtes générées** : `"POI_NAME" Paris`, `"poi_name_normalized" Paris`
-- **Pas de prefix `site:`** : Recherche sur tout le web
-- **Templates utilisés** : `global_templates` uniquement
-- **Portée** : Large, tous domaines confondus
-
-### 2. Mode `serp-only` - Recherche Ciblée
-Effectue des recherches ciblées sur des domaines spécifiques.
+### serp-only  
+Sources: sources spécifiées uniquement (aucune CSE)
+- `collect_from_catalog_filtered(sources=...)` - liste configurable, aucun appel CSE
 
 ```bash
-python -m scripts.mention_scanner.scanner \
+python -m scripts.mention_scanner \
   --mode serp-only \
   --poi-name "Le Rigmarole" \
-  --sources "lefooding.com,timeout.fr,sortiraparis.com" \
-  --cse-num 10 \
-  --jsonl-out out/mentions.serp.jsonl \
-  --debug
+  --sources "lefooding.com,timeout.fr"
 ```
 
-**Caractéristiques :**
-- **Requêtes générées** : `site:domain.com "POI_NAME"`, `site:domain.com "POI_NAME Paris"`, etc.
-- **Prefix `site:`** : Recherche restreinte par domaine
-- **Templates utilisés** : `templates` + `global_templates`
-- **Portée** : Ciblée, domaines spécifiés
-
-### 3. Mode `balanced` - Hybride (Par défaut)
-Actuellement utilise l'implémentation `serp-only` comme fallback.
+### open
+Sources: CSE uniquement, sans sources catalogue
+- `collect_from_cse()` seulement
 
 ```bash
-python -m scripts.mention_scanner.scanner \
-  --mode balanced \
-  --poi-name "Le Rigmarole" \
-  --sources "lefooding.com,timeout.fr" \
+python -m scripts.mention_scanner \
+  --mode open \
+  --poi-name "Septime" \
+  --city-slug paris \
   --debug
 ```
+
+## Golden Rule: CSE Templates
+**Toujours inclure** `{poi_name}`, `{city_name}`, `{category}` dans tous les gabarits CSE.
+
+Pays/langue: appliquer `gl`/`hl`/`cr`/`lr` selon le pays du POI.
+Pas de filtre `site:.tld` par défaut.
+
+## KISS Scoring
+```
+final_score = 0.60*name + 0.25*geo + 0.15*authority (clamp 0–1)
+```
+
+### 3 Composantes
+- **name_score**: 2 signaux distincts (fuzzy + trigram) avec normalisation stopwords simples
+- **geo_score**: distance + bonus arrondissement/CP (une seule source de vérité geo)  
+- **authority**: confirmed > catalog > discovered (poids simple)
+
+### 2 Pénalités
+- **country mismatch** → reject immédiat
+- **city mismatch** → -0.15 (clamp max_penalty)
 
 ## 🔧 Options CLI Détaillées
 
 ### Options Principales
+
 ```bash
---mode {balanced,open,serp-only,strategy}   # Mode de scan (défaut: balanced)
---poi-name "POI_NAME"                       # POI à scanner
---poi-names "POI1,POI2,POI3"               # Plusieurs POIs (CSV)
---sources "domain1.com,domain2.com"        # Domaines cibles (serp-only)
---city-slug paris                          # Ville (défaut: paris)
+--mode {balanced,open,serp-only}        # Mode de scan (défaut: balanced)
+--poi-name "POI_NAME"                   # POI à scanner
+--poi-names "POI1,POI2,POI3"           # Plusieurs POIs (CSV)
+--sources "domain1.com,domain2.com"    # Domaines cibles (serp-only uniquement)
+--city-slug {paris,lyon,marseille}     # Ville (défaut: paris)
 ```
 
 ### Paramètres CSE
+
 ```bash
---cse-num 10                               # Nombre de résultats CSE (1-10)
---no-cache                                 # Désactiver le cache CSE
---allow-no-cse                             # Permettre exécution sans CSE
+--cse-num 10                           # Nombre de résultats CSE (1-50)
+--no-cache                             # Désactiver le cache CSE
+--allow-no-cse                         # Permettre exécution sans CSE
 ```
 
 ### Seuils de Scoring
+
 ```bash
---threshold-high 0.92                      # Seuil score élevé (surcharge config)
---threshold-mid 0.85                       # Seuil score moyen (surcharge config)
+--threshold-high 0.35                  # Seuil score élevé (surcharge config)
+--threshold-mid 0.20                   # Seuil score moyen (surcharge config)
 ```
 
 ### Sortie & Debug
+
 ```bash
---jsonl-out path/to/output.jsonl           # Fichier JSONL de sortie
---log-drop-reasons                         # Logger les raisons de rejet
---dump-serp path/to/dump/dir               # Dumper les réponses CSE brutes
---debug                                    # Logging debug détaillé
+--jsonl-out path/to/output.jsonl       # Fichier JSONL de sortie
+--log-drop-reasons                     # Logger les raisons de rejet
+--dump-serp path/to/dump/dir           # Dumper les réponses CSE brutes
+--debug                                # Logging debug détaillé
 ```
 
 ## 📊 Pipeline de Traitement
 
-### 1. **Génération de Requêtes**
-- **Templates depuis config** : `config.json` → `mention_scanner.query_strategy`
-- **Variables disponibles** : `{poi_name}`, `{poi_name_normalized}`, `{domain}`, `{geo_hint}`, `{category_synonym}`
-- **Déduplication** : Ordre conservé, limite `max_templates_per_poi`
+### 1. **Résolution Dynamique des Villes**
 
-### 2. **Recherche CSE**
-- **API Google Custom Search** avec rate limiting
+- **City Profile** : Chargement automatique des profils de ville
+- **Locale Parameters** : Configuration CSE par pays (`gl=fr&cr=countryFR`)
+- **Templates** : Remplacement de `{city_name}` par la ville réelle
+
+### 2. **Génération de Requêtes**
+
+- **Templates configurables** depuis `config.json`
+- **Variables disponibles** : `{poi_name}`, `{poi_name_normalized}`, `{city_name}`, `{category_synonym}`
+- **Catégorie obligatoire** : Toutes les requêtes incluent le type (restaurant, etc.)
+
+### 3. **Recherche CSE Géolocalisée**
+
+- **API Google CSE** avec paramètres géographiques
 - **Cache persistant** avec TTL configurable
-- **Retry automatique** sur erreurs 429/5xx
+- **Rate limiting** et retry automatique
+- **Filtrage pays** : Résultats locaux prioritaires
 
-### 3. **Matching POI ↔ Article**
-- **Normalisation** : Suppression accents, ponctuation
+### 4. **Matching POI ↔ Article**
+
+- **Normalisation** : Accents, ponctuation, casse
 - **Score trigram** : Similarité textuelle
-- **Score géographique** : Indices Paris/arrondissements
-- **Seuils configurables** : high/mid depuis config
+- **Token matching** : Discrimination par mots-clés
+- **Seuils configurables** depuis config
 
-### 4. **Scoring Final**
-- **Authority score** : Poids par domaine/groupe
-- **Name match** : Correspondance nom POI
-- **Geo hints** : Indicateurs géographiques
-- **Time decay** : Décroissance temporelle
-- **Formule** : Score final = Σ(composants × poids)
+### 5. **Scoring Multi-Composants**
 
-### 5. **Règles d'Acceptation**
+#### Scoring Géographique (Configurable)
+
+```json
+"geo_scoring": {
+  "city_name_score": 0.4,        // Paris détecté dans title/snippet
+  "postal_code_score": 0.3,      // 75001-75020 détecté
+  "admin_region_score": 0.2,     // Île-de-France détecté
+  "country_score": 0.1,          // France détecté
+  "url_city_segment_score": 0.3, // /paris/ dans l'URL
+  "distance_full_score": 0.3,    // <3km du centroid ville
+  "distance_half_score": 0.15    // 3-15km du centroid
+}
 ```
-Accepté SI : score >= threshold_high ET geo_score >= threshold_mid
+
+#### Scoring Final
+
+- **Name matching** : Correspondance nom POI (poids: 50%)
+- **Geo signals** : Indicateurs géographiques (poids: 20%)
+- **Category signals** : Type d'établissement (poids: 15%)
+- **Authority** : Poids du domaine source (poids: 15%)
+
+### 6. **Règles d'Acceptation Intelligentes**
+
+```
+Auto-accept SI :
+  name_score >= 0.5 ET (geo_score >= 0.4 OU authority >= 0.5)
+
+Fallback SI :
+  name_score >= 0.5 ET authority >= 0.6 (sites officiels)
+
+Reject sinon
 ```
 
-### 6. **Déduplication**
-- **Fenêtre temporelle** : `dedup.window_days` depuis config
-- **Déduplication par URL** : Évite les doublons
+### 7. **Déduplication Multi-Langue**
+
+- **Fenêtre temporelle** configurée
+- **Détection doublons** français/anglais
+- **Filtrage domaines exclus** (réseaux sociaux, etc.)
 
 ## 📁 Architecture Modulaire
 
 ```
 scripts/mention_scanner/
-├── scanner.py              # Point d'entrée CLI + orchestrateur
-├── config_resolver.py      # Résolution config + seuils
-├── cse_client.py          # Client Google CSE + cache
+├── scanner.py              # Orchestrateur principal + CLI
+├── city_profiles.py        # Profils villes + géolocalisation
+├── cse_client.py          # Client Google CSE + cache + géoloc
+├── config_resolver.py      # Résolution config centralisée
 ├── matching.py            # Matching POI-article + normalisation
-├── scoring.py             # Algorithmes de scoring + acceptation
-├── dedup.py              # Déduplication temporelle
-├── logging_ext.py        # JSONL writer + summary
-└── domains.py            # Extraction domaines + utilitaires
+├── scoring.py             # Scoring multi-composants configurable
+├── dedup.py              # Déduplication intelligente
+├── domains.py            # Résolution domaines → authority
+└── logging_ext.py        # JSONL writer + summaries
 ```
 
-## 📊 Exemple de Summary
+## ⚙️ Configuration Centralisée
 
-```
-==================================================
-GATTO MENTION SCANNER - RUN SUMMARY
-==================================================
-POIs processed: 1
-CSE queries: 6
-SERP items returned: 39
-Cache hits/misses: 4/2 (66.7% hit rate)
-Candidates found: 0
-Accepted: 0
-Rejected: 0
-Upserts: 0
-Top domains (count):
-  lefooding.com: 5
-  timeout.fr: 3
-==================================================
-```
+Tous les paramètres sont configurables via `config.json` (aucun hardcodé) :
 
-## 📄 Format JSONL
-
-Chaque ligne du fichier JSONL contient :
-```json
-{
-  "poi_id": "poi_Le_Rigmarole",
-  "poi_name": "Le Rigmarole", 
-  "query": "site:lefooding.com \"Le Rigmarole\"",
-  "domain": "lefooding.com",
-  "url": "https://lefooding.com/restaurant/le-rigmarole",
-  "score": 0.89,
-  "threshold_used": "high=0.92,mid=0.85",
-  "decision": "reject",
-  "drop_reasons": ["score_too_low: 0.89 < 0.92"],
-  "strategy": "serp_only",
-  "ts": "2025-09-10T18:30:45.123Z"
-}
-```
-
-## ⚙️ Configuration
-
-Tous les paramètres sont configurables via `config.json` :
+### Configuration Mention Scanner
 
 ```json
 {
   "mention_scanner": {
+    "mode": "balanced",
     "match_score": {
-      "high": 0.92,
-      "mid": 0.85
+      "high": 0.35,
+      "mid": 0.2
     },
-    "limits": {
-      "cse_num": 10,
-      "max_templates_per_poi": 6
+    "scoring": {
+      "name_weight": 0.5,
+      "geo_weight": 0.2,
+      "cat_weight": 0.15,
+      "authority_weight": 0.15,
+      "max_penalty": 0.4
     },
-    "query_strategy": {
-      "templates": [
-        "site:{domain} \"{poi_name}\"",
-        "site:{domain} \"{poi_name_normalized}\"", 
-        "site:{domain} \"{poi_name} {geo_hint}\"",
-        "site:{domain} \"{poi_name}\" {category_synonym}"
-      ],
-      "global_templates": [
-        "\"{poi_name}\" Paris",
-        "\"{poi_name_normalized}\" Paris"
-      ],
-      "geo_hints": ["Paris", "750", "1er", "2e", ...],
-      "category_synonyms": {
-        "restaurant": ["restaurant", "bistrot", "brasserie"]
-      }
+    "geo_scoring": {
+      "city_name_score": 0.4,
+      "postal_code_score": 0.3,
+      "admin_region_score": 0.2,
+      "country_score": 0.1,
+      "url_city_segment_score": 0.3,
+      "distance_full_score": 0.3,
+      "distance_half_score": 0.15,
+      "distance_full_threshold_km": 3,
+      "distance_half_threshold_km": 15
     },
-    "dedup": {
-      "window_days": 21
+    "debug_mode": {
+      "threshold_high": 0.3,
+      "threshold_mid": 0.15,
+      "token_required_for_mid": false
+    }
+  }
+}
+```
+
+### Configuration Templates
+
+```json
+{
+  "query_strategy": {
+    "templates": [
+      "{multi_site_query} \"{poi_name} {category_synonym} {city_name}\""
+    ],
+    "global_templates": [
+      "\"{poi_name}\" {category_synonym} {city_name}"
+    ],
+    "geo_hints": ["Paris", "750", "1er", "2e", ...],
+    "category_synonyms": {
+      "restaurant": ["restaurant", "bistrot", "brasserie"],
+      "bar": ["bar à cocktails", "cocktail bar", "bar"],
+      "cafe": ["café", "coffee shop", "coffee"]
     }
   }
 }
@@ -218,60 +257,162 @@ Tous les paramètres sont configurables via `config.json` :
 
 ## 🚀 Exemples d'Usage
 
-### Scan Ouvert Multi-POI
+### Scan Balanced Multi-Ville
+
 ```bash
-python -m scripts.mention_scanner.scanner \
-  --mode open \
+# Paris - Recherche équilibrée
+python -m scripts.mention_scanner \
+  --mode balanced \
+  --poi-name "L'Ambroisie" \
+  --city-slug paris \
+  --cse-num 15
+
+# Lyon - Support natif
+python -m scripts.mention_scanner \
+  --mode balanced \
+  --poi-name "Paul Bocuse" \
+  --city-slug lyon \
+  --cse-num 15
+```
+
+### Scan Multi-POI
+
+```bash
+python -m scripts.mention_scanner \
+  --mode balanced \
   --poi-names "Septime,Le Chateaubriand,L'Astrance" \
-  --cse-num 5 \
+  --city-slug paris \
+  --cse-num 10 \
   --jsonl-out out/multi_poi.jsonl
 ```
 
-### Scan Ciblé avec Cache Désactivé
-```bash
-python -m scripts.mention_scanner.scanner \
-  --mode serp-only \
-  --poi-name "Pierre Hermé" \
-  --sources "lefooding.com,sortiraparis.com" \
-  --no-cache \
-  --dump-serp out/debug \
-  --debug
-```
+### Debug Mode avec Seuils Abaissés
 
-### Test avec Seuils Personnalisés
 ```bash
-python -m scripts.mention_scanner.scanner \
-  --mode serp-only \
-  --poi-name "Du Pain et des Idées" \
-  --sources "timeout.fr" \
-  --threshold-high 0.8 \
-  --threshold-mid 0.6 \
+# Active le debug mode depuis la config
+export SCAN_DEBUG=1
+
+python -m scripts.mention_scanner \
+  --mode balanced \
+  --poi-name "Restaurant Test" \
+  --city-slug paris \
+  --debug \
   --log-drop-reasons
 ```
 
-## 🔍 Debug et Troubleshooting
+### Scan Ciblé avec Sources Spécifiques
 
-### Activer le Debug Complet
 ```bash
+python -m scripts.mention_scanner \
+  --mode serp-only \
+  --poi-name "Pierre Hermé" \
+  --sources "lefooding.com,gaultmillau.com,guide.michelin.com" \
+  --city-slug paris \
+  --no-cache \
+  --dump-serp out/debug
+```
+
+## 📊 Exemple de Summary
+
+```
+🎯 Balanced Scan Results:
+  • Total mentions: 23
+  • Accepted: 18
+  • Rejected: 5
+  • CSE calls: 8
+  • Cache hits: 2
+  • Top domains: {'fr.gaultmillau.com': 5, 'guide.michelin.com': 4, 'lefooding.com': 3}
+```
+
+## 📄 Format JSONL
+
+Chaque ligne contient une mention avec sa décision :
+
+```json
+{
+  "poi_id": "3deddea0-c61d-46c4-9d3f-3f5c13945d5b",
+  "poi_name": "L'Ambroisie",
+  "query": "\"L'Ambroisie\" restaurant Paris",
+  "domain": "guide.michelin.com",
+  "url": "http://guide.michelin.com/fr/fr/ile-de-france/paris/restaurant/l-ambroisie",
+  "score": 0.6628571428571429,
+  "threshold_used": "high=0.35,mid=0.2",
+  "decision": "accept",
+  "drop_reasons": [],
+  "strategy": "balanced",
+  "ts": "2025-09-13T18:41:03.823880+00:00"
+}
+```
+
+## 🔍 Debug et Monitoring
+
+### Mode Debug Complet
+
+```bash
+export SCAN_DEBUG=1  # Active les seuils debug depuis config
 --debug --log-drop-reasons --dump-serp out/debug
 ```
 
-### Vérifier la Configuration CSE
+### Audit Détaillé
+
+Le mode debug génère un audit JSONL complet dans `out/audit_*.jsonl` avec :
+
+- Geo signals détectés
+- Name matching breakdown
+- Score components
+- Sanity checks
+
+### Vérification Géolocalisation
+
 ```bash
-echo $GOOGLE_CUSTOM_SEARCH_API_KEY
-echo $GOOGLE_CUSTOM_SEARCH_ENGINE_ID
+# Vérifier les paramètres CSE par ville
+python -c "
+from scripts.mention_scanner.city_profiles import city_manager
+print('Paris:', city_manager.get_search_locale('paris'))
+print('Lyon:', city_manager.get_search_locale('lyon'))
+"
 ```
 
-### Analyser les Rejets
-Le flag `--log-drop-reasons` log les raisons précises de rejet dans le JSONL.
+## 🔄 Intégration Pipeline
 
-## 🔄 Migration depuis l'Ancien Scanner
+Le scanner s'intègre parfaitement avec `run_pipeline.py` :
 
-- ❌ **`scripts/gatto_mention_scanner.py`** → supprimé
-- ✅ **`python -m scripts.mention_scanner.scanner`** → nouvelle interface
-- ✅ **Arguments CLI identiques** → compatibilité préservée
-- ✅ **Logique métier inchangée** → mêmes décisions
+```bash
+# Scan mentions avec pipeline complet
+python run_pipeline.py \
+  --mode mentions \
+  --seed-poi-name "L'Ambroisie" \
+  --seed-city paris \
+  --cse-num 15 \
+  --debug
+```
+
+## 📈 Améliorations Récentes
+
+### ✅ Architecture Nettoyée
+
+- Suppression du code mort (`ContentFetcher`)
+- Configuration 100% centralisée
+- Aucun hardcodé restant
+
+### ✅ Support Multi-Ville
+
+- Templates dynamiques par ville
+- Géolocalisation CSE automatique
+- Profils de ville extensibles (Paris, Lyon, Marseille)
+
+### ✅ Géolocalisation Intelligente
+
+- Paramètres CSE par pays (`gl=fr&cr=countryFR`)
+- Réduction du bruit multilingue
+- Scoring géographique configurable
+
+### ✅ Scoring Avancé
+
+- Règles d'acceptation intelligentes
+- Debug mode configurable
+- Audit complet des décisions
 
 ---
 
-**Note** : Ce scanner est entièrement configurable et n'utilise aucune valeur en dur. Tous les seuils, limites et paramètres proviennent de `config.json` avec des fallbacks documentés.
+**Note** : Ce scanner est entièrement configurable et n'utilise aucune valeur en dur. Tous les paramètres, seuils et scores proviennent de `config.json` avec fallbacks documentés. L'architecture modulaire permet une extension facile pour de nouvelles villes et fonctionnalités.

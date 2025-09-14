@@ -9,7 +9,6 @@ from .scanner import GattoMentionScanner
 
 # Core components  
 from .cse_client import CSESearcher
-from .content_fetcher import ContentFetcher
 from .matching import MentionMatcher, normalize
 from .dedup import MentionDeduplicator, dedupe_key
 
@@ -22,7 +21,6 @@ from .logging_ext import JSONLWriter, print_stable_summary
 __all__ = [
     'GattoMentionScanner',
     'CSESearcher', 
-    'ContentFetcher',
     'MentionMatcher',
     'MentionDeduplicator',
     'JSONLWriter',
