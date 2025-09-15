@@ -124,7 +124,7 @@ class CSESearcher:
         """Search using Google CSE with persistent caching and retry logic"""
         # Generate cache params for the key format
         start = 1
-        num = min(cse_num, 10)  # CSE max is 10
+        num = min(cse_num, 10)  # Google CSE API max per request is 10
         cache_params = {'start': start, 'num': num, 'gl': gl, 'hl': hl, 'cr': cr}
         
         # Check persistent cache first (unless no_cache is enabled)

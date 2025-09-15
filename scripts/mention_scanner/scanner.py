@@ -65,25 +65,25 @@ except ImportError:
 try:
     from .config_resolver import resolve_config
     from .cse_client import CSESearcher
-    from .matching import MentionMatcher
     from .dedup import MentionDeduplicator
     from .logging_ext import JSONLWriter
     from .city_profiles import CityProfileManager
     from .scoring import final_score, make_tabular_decision
     from .domains import domain_of
     from .collection_router import CollectionRouter
+    from .date_enricher import DateEnricher
 except ImportError:
     # Fallback for direct execution
     try:
         from config_resolver import resolve_config
         from cse_client import CSESearcher
-        from matching import MentionMatcher
         from dedup import MentionDeduplicator
         from logging_ext import JSONLWriter
         from city_profiles import CityProfileManager
         from scoring import final_score, make_tabular_decision
         from domains import domain_of
         from collection_router import CollectionRouter
+        from date_enricher import DateEnricher
     except ImportError as e:
         logger.error(f"Failed to import required modules: {e}")
         raise ConfigurationError(f"Module imports failed - check dependencies: {e}")
@@ -114,16 +114,16 @@ class GattoMentionScanner:
     """KISS Scanner - 3 modes: balanced, serp-only, open"""
     
     def __init__(self, debug: bool = False, allow_no_cse: bool = False, 
-                 jsonl_out: str = None, log_drop_reasons: bool = False):
+                 jsonl_out: str = None, log_drop_reasons: bool = False, cli_args=None):
         self.db = SupabaseManager()
         self.debug = debug
         self._allow_no_cse = allow_no_cse
-        self.config = resolve_config()  # Use unified config resolver
+        self.config = resolve_config(cli_args)  # Use unified config resolver
         
         # Initialize KISS components 
-        self.matcher = MentionMatcher()
         self.deduplicator = MentionDeduplicator(config=self.config)
         self.city_manager = CityProfileManager()
+        self.date_enricher = DateEnricher()
         
         # Get thresholds from unified config (match_score structure from config.json)
         thresholds = self.config['mention_scanner']['match_score']
@@ -303,6 +303,7 @@ class GattoMentionScanner:
                           limit_per_poi: int = None, **kwargs) -> Dict[str, Any]:
         """KISS Balanced mode: collect_from_catalog_active_sources() + collect_from_cse()"""
         results = {'accepted': 0, 'rejected': 0, 'total_mentions': 0}
+        category = kwargs.get('category', 'restaurant')  # Extract category with fallback
         
         try:
             # Prepare POIs
@@ -311,7 +312,7 @@ class GattoMentionScanner:
                 pois.append({
                     "id": f"poi_{poi_name}", 
                     "name": poi_name, 
-                    "category": "restaurant", 
+                    "category": category,  # Use category parameter 
                     "city_slug": city_slug
                 })
             
@@ -352,6 +353,7 @@ class GattoMentionScanner:
                       limit_per_poi: int = None, **kwargs) -> Dict[str, Any]:
         """KISS Open mode: collect_from_cse() only (no site: filtering)"""
         results = {'accepted': 0, 'rejected': 0, 'total_mentions': 0}
+        category = kwargs.get('category', 'restaurant')  # Extract category with fallback
         
         try:
             # Prepare POIs
@@ -360,7 +362,7 @@ class GattoMentionScanner:
                 pois.append({
                     "id": f"poi_{poi_name}", 
                     "name": poi_name, 
-                    "category": "restaurant", 
+                    "category": category,  # Use category parameter 
                     "city_slug": city_slug
                 })
             
@@ -392,8 +394,13 @@ class GattoMentionScanner:
 
     def scan_serp_only(self, poi_names: List[str], source_ids: List[str], city_slug: str = 'paris', 
                       limit_per_poi: int = None, **kwargs) -> Dict[str, Any]:
-        """KISS SERP-only mode: collect_from_catalog_filtered() - no CSE calls"""
+        """KISS SERP-only mode: collect_from_catalog_filtered() - no open CSE calls
+        
+        SERP-only = sources spécifiées uniquement via site: (pas de requêtes ouvertes)
+        Uses only specified sites/domains with site: operator - no open CSE queries
+        """
         results = {'accepted': 0, 'rejected': 0, 'total_mentions': 0}
+        category = kwargs.get('category', 'restaurant')  # Extract category with fallback
         
         try:
             # Prepare POIs
@@ -402,7 +409,7 @@ class GattoMentionScanner:
                 pois.append({
                     "id": f"poi_{poi_name}", 
                     "name": poi_name, 
-                    "category": "restaurant", 
+                    "category": category,  # Use category parameter 
                     "city_slug": city_slug
                 })
             
@@ -505,13 +512,28 @@ class GattoMentionScanner:
                     debug=True,
                     city_slug=city_slug,
                     poi_coords=(poi.get('lat'), poi.get('lng')) if poi.get('lat') and poi.get('lng') else None,
-                    db_manager=self.db
+                    db_manager=self.db,
+                    published_at=candidate.get('published_at')  # Pass time decay data
                 )
                 
                 # Make tabular decision
                 decision, accepted_by, drop_reasons = make_tabular_decision(
                     score, explain, candidate, self.high_threshold, self.mid_threshold
                 )
+                
+                # Enrich with published_at if accepted (KISS: only for accepted mentions)
+                if decision in ["ACCEPT", "REVIEW"]:
+                    source_catalog_entry = None
+                    if self.db:
+                        try:
+                            source_id = self.db.get_source_id_from_domain(candidate['domain'])
+                            if source_id:
+                                sources = self.db._load_source_catalog()
+                                source_catalog_entry = next((s for s in sources if s.get('source_id') == source_id), None)
+                        except Exception:
+                            pass  # Continue without source catalog
+                    
+                    candidate = self.date_enricher.enrich(candidate, source_catalog_entry)
                 
                 # Log decision in JSON format
                 self._log_decision_json(poi, candidate, score, explain, decision, accepted_by, drop_reasons)
@@ -596,6 +618,14 @@ class GattoMentionScanner:
                 'authority': explain['components']['authority']
             }
         }
+        
+        # Add published_at info if available
+        if candidate.get('published_at'):
+            log_entry['published_at'] = {
+                'date': candidate.get('published_at'),
+                'confidence': candidate.get('published_at_confidence'),
+                'method': candidate.get('published_at_method')
+            }
         
         # Log in debug mode
         if self.debug:
@@ -691,436 +721,6 @@ class GattoMentionScanner:
         
         return filtered_candidates
 
-    def run_serp_pipeline(self, poi: Dict[str, Any], config: Dict[str, Any], summary, jsonl_writer, 
-                         *, sources: Optional[List[str]] = None, strategy_label: str, cli_overrides=None, 
-                         cse_num: int = None, limit_per_poi: int = None, no_cache: bool = False, dump_serp_dir: str = None,
-                         sources_are_domains: bool = False, city_slug: str = 'paris') -> None:
-        """Reusable SERP pipeline for POI scanning with configurable source filtering"""
-        from .config_resolver import _resolve_thresholds
-        from .domains import domain_of
-        from .scoring import final_score
-        from .dedup import MentionDeduplicator
-        
-        poi_name = poi.get('name', '')
-        poi_id = poi.get('id', '')
-        poi_category = poi.get('category', 'restaurant')
-        
-        if not poi_name:
-            logger.warning(f"POI {poi_id} has no name, skipping")
-            return
-        
-        # Convert source_ids to domains for CSE queries (skip if already domains)
-        if sources and not sources_are_domains:
-            sources = self._resolve_source_ids_to_domains(sources)
-        
-        # Resolve thresholds from CLI > config > defaults
-        high_threshold, mid_threshold = _resolve_thresholds(cli_overrides, config)
-        
-        # Get config parameters with fallbacks
-        mention_scanner_config = config.get('mention_scanner', {}) if config else {}
-        
-        # Apply DEBUG mode threshold overrides
-        debug_override = False
-        if os.getenv('SCAN_DEBUG') == '1':
-            debug_config = mention_scanner_config.get('debug_mode', {})
-            high_threshold = debug_config.get('threshold_high', 0.30)
-            mid_threshold = debug_config.get('threshold_mid', 0.15)
-            debug_override = True
-            logger.info("🐛 DEBUG MODE: thresholds_effective high=%.2f, mid=%.2f (debug_override=True)", 
-                       high_threshold, mid_threshold)
-            
-            # Override token_required in debug mode to allow more matches
-            cli_overrides.token_required_for_mid = debug_config.get('token_required_for_mid', False)
-            # Override thresholds for matcher too
-            cli_overrides.threshold_high = high_threshold  
-            cli_overrides.threshold_mid = mid_threshold
-            logger.info("🐛 DEBUG MODE: token_required_for_mid=%s, thresholds updated for matcher (debug_override)", 
-                       cli_overrides.token_required_for_mid)
-        else:
-            logger.info("📊 NORMAL MODE: thresholds_effective high=%.2f, mid=%.2f (debug_override=False)", 
-                       high_threshold, mid_threshold)
-        
-        query_config = mention_scanner_config.get('query_strategy', {})
-        limits_config = mention_scanner_config.get('limits', {})
-        
-        # Build context for templates with dynamic city
-        poi_name_normalized = self.matcher.normalize(poi_name)
-        
-        # Get city name from city profile for dynamic templates
-        city_profile = self.city_manager.get_profile(city_slug)
-        city_name = city_profile.city_names_aliases[0].title() if city_profile else city_slug.title()
-        
-        # Build queries from templates
-        templates = query_config.get('templates', ['"{poi_name}"'])
-        global_templates = query_config.get('global_templates', [])
-        max_templates = query_config.get('max_templates_per_poi', 6)
-        geo_hints = query_config.get('geo_hints', [city_name])
-        category_synonyms = query_config.get('category_synonyms', {}).get(poi_category, [poi_category])
-        
-        # CSE parameters from config
-        if cse_num is None:
-            cse_num = limits_config.get('cse_num', 10)
-        max_cse_num = limits_config.get('cse_num', 10)
-        cse_num = min(cse_num, max_cse_num)
-        
-        context = {
-            'poi_name': poi_name,
-            'poi_name_normalized': poi_name_normalized,
-            'geo_hint': geo_hints[0] if geo_hints else city_name,
-            'category_synonym': category_synonyms[0] if category_synonyms else poi_category,
-            'city_name': city_name
-        }
-        
-        # Generate queries
-        queries = []
-        
-        if sources is None:
-            # Global queries without site: prefix - only use global_templates
-            for template in global_templates[:max_templates]:
-                try:
-                    query = template.format(**context)
-                    # Normalize quotes to ASCII
-                    query = query.replace('"', '"').replace('"', '"')
-                    if query not in queries:
-                        queries.append(query)
-                except KeyError as e:
-                    logger.debug(f"Skipping template '{template}' in open mode: missing key {e}")
-                    continue
-        else:
-            # Create multi-site queries by grouping domains
-            batch_size = 8  # Group domains in batches of 8 for OR queries
-            domain_batches = [sources[i:i + batch_size] for i in range(0, len(sources), batch_size)]
-            
-            for batch in domain_batches:
-                # Create multi-site query: "site:a.com OR site:b.com OR site:c.com"
-                multi_site = " OR ".join([f"site:{domain}" for domain in batch])
-                context['multi_site_query'] = multi_site
-                
-                for template in templates:
-                    try:
-                        query = template.format(**context)
-                        # Normalize quotes to ASCII  
-                        query = query.replace('"', '"').replace('"', '"')
-                        if query not in queries:
-                            queries.append(query)
-                    except KeyError as e:
-                        logger.debug(f"Skipping template '{template}' for batch {batch}: missing key {e}")
-                        continue
-            
-            # Add global templates for broader coverage
-            for template in global_templates:
-                try:
-                    query = template.format(**context)
-                    query = query.replace('"', '"').replace('"', '"')
-                    if query not in queries:
-                        queries.append(query)
-                except KeyError as e:
-                    logger.debug(f"Skipping global template '{template}': missing key {e}")
-                    continue
-        
-        # Limit total queries per POI
-        queries = queries[:max_templates]
-        
-        # Collect all candidates
-        candidates = []
-        accepted_count = 0
-        
-        # Step-by-step counters for debugging
-        serp_items_total = 0
-        candidates_created = 0
-        candidates_scored = 0
-        drop_reasons_seen = []
-        
-        # Debug scoring for first N items
-        debug_scoring_limit = 5  # Could be made configurable
-        items_detailed = 0
-        
-        for query in queries:
-            if not self.cse_searcher:
-                logger.warning("CSE searcher not available, skipping query")
-                continue
-                
-            # Get locale-specific search parameters
-            locale_params = self.city_manager.get_search_locale(city_slug)
-            
-            # Search with CSE (pass summary for cache stats)
-            with performance_timer("cse_search", poi_name=poi_name, 
-                                 extra_context={"query": query, "cse_num": cse_num, "locale": locale_params}):
-                results = self.cse_searcher.search(query, debug=self.debug, cse_num=cse_num, summary=summary, 
-                                                 no_cache=no_cache, dump_serp_dir=dump_serp_dir,
-                                                 gl=locale_params['gl'], hl=locale_params['hl'], cr=locale_params['cr'])
-                logger.info(f"CSE search for '{query}' returned {len(results) if results else 0} results")
-            summary.increment_cse_call()
-            
-            # Count SERP items
-            if hasattr(summary, 'serp_items_total'):
-                summary.serp_items_total += len(results)
-            
-            logger.info(f"Query '{query}' returned {len(results)} results")
-            if not results:
-                logger.info(f"No results for query '{query}', skipping")
-                continue
-            
-            # Count SERP items for this query
-            serp_items_total += len(results)
-            
-            for item in results:
-                # Create candidate object
-                url = item.get('link', item.get('formattedUrl', ''))
-                title = item.get('title', '')
-                snippet = item.get('snippet', '')
-                source_domain = domain_of(url)
-                
-                # Log SERP item processing
-                if self.debug_drop_logging:
-                    logger.info("SERP[%s]: %s | url=%s | title=%s | snippet=%s | poi_context(name='%s', city=%s, lat=%s, lng=%s)",
-                               source_domain, url, url, title[:100], snippet[:100], 
-                               poi.get('name'), poi.get('city_slug') or poi.get('city'), poi.get('lat'), poi.get('lng'))
-                
-                candidate = {
-                    'url': url,
-                    'displayLink': item.get('displayLink', ''),
-                    'formattedUrl': item.get('formattedUrl', ''),
-                    'title': title,
-                    'snippet': snippet,
-                    'published_at': item.get('pagemap', {}).get('metatags', [{}])[0].get('article:published_time'),
-                    'domain': source_domain,
-                    'source_domain': source_domain,
-                    'query_used': query,
-                    'poi_id': poi_id,
-                    'poi_name': poi_name
-                }
-                
-                # Count candidate creation
-                candidates_created += 1
-                
-                # Matching score
-                # LOG: ce qu'on envoie vraiment au matcher
-                logger.info("POI context → name='%s', lat=%s, lng=%s, city=%s",
-                           poi.get('name'), poi.get('lat'), poi.get('lng'), poi.get('city_slug') or poi.get('city'))
-                match_result = self.matcher.match_poi_to_article(poi, candidate['title'], config=config, cli_overrides=cli_overrides)
-                if not match_result:
-                    if self.debug_drop_logging:
-                        # Get detailed reason from matcher by calling it again in debug mode
-                        poi_name = poi.get('name', '')
-                        poi_norm = self.matcher.normalize(poi_name) 
-                        title_norm = self.matcher.normalize(candidate['title'])
-                        trigram_score = self.matcher.trigram_score(poi_norm, title_norm)
-                        
-                        # Use already resolved thresholds (no need to re-resolve here)
-                        
-                        # Get trigram_min from config
-                        trigram_min = 0.15  # Default fallback
-                        if config and 'mention_scanner' in config:
-                            trigram_min = config['mention_scanner'].get('match_score', {}).get('trigram_min', 0.15)
-                        
-                        if trigram_score < trigram_min:
-                            reason = f"trigram_too_low: {trigram_score:.3f} < {trigram_min}"
-                        elif trigram_score < high_threshold:
-                            # Check if this is specifically a token requirement failure
-                            poi_tokens = set(self.matcher.extract_tokens(poi.get('name', '')))
-                            title_tokens = set(self.matcher.extract_tokens(candidate['title']))
-                            has_discriminant = bool(poi_tokens & title_tokens)
-                            
-                            # Get token_required setting
-                            token_required = True
-                            if config and 'mention_scanner' in config:
-                                name_match_cfg = config['mention_scanner'].get('name_match', {})
-                                token_required = name_match_cfg.get('require_token_for_mid', True)
-                            
-                            if token_required and not has_discriminant:
-                                reason = f"token_required_mid: trigram={trigram_score:.3f} >= {mid_threshold} but no token match"
-                            else:
-                                reason = f"trigram_mid_range: {trigram_score:.3f}, failed other requirements (geo/etc)"
-                        else:
-                            reason = "unknown_matcher_rejection"
-                            
-                        # Collect drop reasons for summary
-                        drop_reasons_seen.append(reason)
-                            
-                        # Use specific DROP category for token requirements
-                        drop_category = "token_required_mid" if "token_required_mid" in reason else "matching_failed"
-                        logger.info("DROP[%s]: %s | %s | trigram=%.3f | title='%s'", 
-                                   drop_category, url, reason, trigram_score, candidate['title'][:100])
-                    continue
-                    
-                summary.increment_candidate()
-                
-                # Calculate final score (with debug for first N items, but always get components for intelligent acceptance)
-                show_debug = self.debug_drop_logging and items_detailed < debug_scoring_limit
-                
-                # Always get explain for intelligent acceptance (not just for debug display)
-                city_slug = poi.get('city_slug', 'paris')
-                poi_coords = None
-                if poi.get('lat') is not None and poi.get('lng') is not None:
-                    poi_coords = (poi['lat'], poi['lng'])
-                
-                with performance_timer("scoring_computation", poi_name=poi_name, 
-                                     extra_context={"url": candidate['url'], "candidate_count": candidates_scored + 1}):
-                    score, explain = final_score(poi_name, candidate['title'], candidate['snippet'], 
-                                                candidate['url'], poi_category, config, debug=True,
-                                                city_slug=city_slug, poi_coords=poi_coords, db_manager=self.db)
-                    
-                # Ensure we always have a float score
-                if isinstance(score, tuple):
-                    score = score[0]  # Extract float from (score, explain) tuple if needed
-                    
-                candidate['score'] = score
-                candidate['match_score'] = match_result.get('score', 0.0) 
-                
-                # Use scoring components (now always available)
-                candidate['geo_score'] = explain['components']['geo_score']
-                
-                # Count candidate scoring
-                candidates_scored += 1
-                
-                # Comprehensive instrumentation for all candidates (not just first N)
-                audit_data = self._audit_candidate(candidate, poi, match_result, explain, high_threshold, mid_threshold, config)
-                
-                # Log detailed scoring breakdown for first N items
-                if show_debug and items_detailed < debug_scoring_limit:
-                    items_detailed += 1
-                    self._log_detailed_audit(audit_data, items_detailed, url)
-                
-                # Check acceptance with type safety
-                drop_reasons = []
-                
-                # Type safety assertions
-                if not isinstance(score, (int, float)):
-                    logger.error("FATAL: score is not numeric: %s (type: %s)", score, type(score))
-                    raise ValueError(f"Score must be numeric, got {type(score)}: {score}")
-                    
-                geo_score_value = candidate.get('geo_score', 0.0)
-                if not isinstance(geo_score_value, (int, float)):
-                    logger.error("FATAL: geo_score is not numeric: %s (type: %s)", geo_score_value, type(geo_score_value))
-                    raise ValueError(f"Geo score must be numeric, got {type(geo_score_value)}: {geo_score_value}")
-                
-                # Use intelligent acceptance rules
-                from .scoring import is_acceptable_intelligent
-                
-                name_match = explain['components']['name_match']
-                authority = explain['components']['authority']
-                poi_coords = None
-                if poi.get('lat') is not None and poi.get('lng') is not None:
-                    poi_coords = (poi['lat'], poi['lng'])
-                
-                acceptable, drop_reasons = is_acceptable_intelligent(
-                    name_match, geo_score_value, authority, score, 
-                    high_threshold, mid_threshold, poi_coords, config, candidate.get('domain', '')
-                )
-                
-                if not acceptable:
-                    # Collect drop reasons for summary
-                    drop_reasons_seen.extend(drop_reasons)
-                    
-                    # Log DROP for threshold failures
-                    if self.debug_drop_logging:
-                        logger.info("DROP[threshold_failed]: %s | reasons=%s | score=%.3f | geo_score=%.3f", 
-                                   url, ', '.join(drop_reasons), score, candidate.get('geo_score', 0.0))
-                
-                candidate['drop_reasons'] = drop_reasons
-                candidate['acceptable'] = acceptable
-                
-                # Store audit data in candidate for potential JSONL output
-                candidate['audit_data'] = audit_data
-                
-                # Write to audit JSONL if enabled
-                if self.audit_jsonl_file:
-                    self._write_audit_jsonl(audit_data)
-                
-                # Write to JSONL if enabled
-                if jsonl_writer and jsonl_writer.enabled:
-                    decision = "accept" if acceptable else "reject"
-                    threshold_used = f"high={high_threshold},mid={mid_threshold}"
-                    jsonl_writer.write_mention(
-                        poi_id, poi_name, query, candidate['domain'], candidate['url'],
-                        score, threshold_used, decision, drop_reasons, strategy_label
-                    )
-                
-                candidates.append(candidate)
-                
-                if acceptable:
-                    accepted_count += 1
-                    domain = candidate['domain']
-                    summary.increment_accepted(domain)
-                    
-                    # Check limit per POI
-                    if limit_per_poi and accepted_count >= limit_per_poi:
-                        break
-                else:
-                    summary.increment_rejected()
-            
-            if limit_per_poi and accepted_count >= limit_per_poi:
-                break
-        
-        # Apply deduplication
-        if candidates:
-            accepted_candidates = [c for c in candidates if c.get('acceptable')]
-            
-            # Filter out excluded domains (social networks, review sites)
-            filtered_candidates = self._filter_excluded_domains(accepted_candidates)
-            excluded_count = len(accepted_candidates) - len(filtered_candidates)
-            if excluded_count > 0:
-                logger.info(f"Domain exclusion: {len(accepted_candidates)} → {len(filtered_candidates)} (-{excluded_count} excluded domains)")
-            accepted_candidates = filtered_candidates
-            
-            # Apply intelligent deduplication with multi-language support
-            source_catalog_cache = None
-            if self.db:
-                try:
-                    self.db._load_source_catalog()
-                    source_catalog_cache = self.db._source_catalog_cache
-                except Exception as e:
-                    logger.debug(f"Failed to load source catalog for dedup: {e}")
-            
-            deduplicated_accepted = self.deduplicator.filter(accepted_candidates, source_catalog_cache)
-            
-            # Log deduplication stats
-            if len(accepted_candidates) > len(deduplicated_accepted):
-                removed_count = len(accepted_candidates) - len(deduplicated_accepted)
-                logger.info(f"Deduplication: {len(accepted_candidates)} → {len(deduplicated_accepted)} (-{removed_count} duplicates)")
-            
-            # Persist accepted mentions to database
-            if deduplicated_accepted and self.db:
-                upserted_count = self._persist_accepted_mentions(poi, deduplicated_accepted)
-                logger.info(f"  • Upserted to DB: {upserted_count}")
-            
-            # Note: summary counters already incremented during processing
-            
-        # Log step-by-step counters for debugging
-        rejected_count = candidates_scored - accepted_count
-        logger.info(f"POI {poi_name} processing summary:")
-        logger.info(f"  • Queries executed: {len(queries)}")
-        logger.info(f"  • SERP items returned: {serp_items_total}")
-        logger.info(f"  • Candidates created: {candidates_created}")
-        logger.info(f"  • Candidates scored: {candidates_scored}")
-        logger.info(f"  • Accepted: {accepted_count}")
-        logger.info(f"  • Rejected: {rejected_count}")
-        
-        # If no candidates were created, log top 3 distinct drop reasons
-        if candidates_created == 0 and drop_reasons_seen:
-            from collections import Counter
-            reason_counts = Counter(drop_reasons_seen)
-            top_reasons = reason_counts.most_common(3)
-            logger.info(f"  • Top 3 drop reasons (no candidates created):")
-            for i, (reason, count) in enumerate(top_reasons, 1):
-                logger.info(f"    {i}. {reason} ({count} occurrences)")
-
-    def run_serp_only_for_poi(self, poi: Dict[str, Any], source_ids: List[str], config: Dict[str, Any], 
-                             summary, jsonl_writer, cli_overrides, cse_num: int, limit_per_poi: int = None, city_slug: str = 'paris'):
-        """Run SERP-only scanning for a single POI using reusable pipeline"""
-        self.run_serp_pipeline(
-            poi=poi,
-            config=config,
-            summary=summary,
-            jsonl_writer=jsonl_writer,
-            sources=source_ids,
-            strategy_label="serp_only",
-            cli_overrides=cli_overrides,
-            cse_num=cse_num,
-            limit_per_poi=limit_per_poi,
-            city_slug=city_slug
-        )
     
     def _persist_accepted_mentions(self, poi: Dict[str, Any], accepted_candidates: List[Dict[str, Any]]) -> int:
         """
@@ -1182,6 +782,11 @@ class GattoMentionScanner:
                         scoring = candidate['audit_data'].get('scoring', {})
                         score_components = scoring.get('components', {})
                     
+                    # Extract published_at fields from date enrichment
+                    published_at = candidate.get('published_at')
+                    published_at_confidence = candidate.get('published_at_confidence') 
+                    published_at_method = candidate.get('published_at_method')
+                    
                     # Upsert using new method that handles both cataloged and discovered sources
                     success = self.db.upsert_source_mention_new(
                         poi_id=poi_id,
@@ -1193,6 +798,9 @@ class GattoMentionScanner:
                         serp_position=serp_position,
                         final_score=final_score,
                         score_components=score_components,
+                        published_at=published_at,
+                        published_at_confidence=published_at_confidence,
+                        published_at_method=published_at_method,
                         source_id=source_info.get('source_id'),
                         discovered_source_id=source_info.get('discovered_source_id')
                     )
@@ -1208,22 +816,30 @@ class GattoMentionScanner:
     
     def _audit_candidate(self, candidate: Dict[str, Any], poi: Dict[str, Any], match_result: Dict[str, Any], 
                         explain: Optional[Dict[str, Any]], high_threshold: float, mid_threshold: float, config: Dict[str, Any]) -> Dict[str, Any]:
-        """Comprehensive candidate audit with detailed instrumentation"""
-        from .scoring import geo_hint_detailed, name_match_detailed
+        """KISS candidate audit - simplified for clean implementation"""
         
         url = candidate.get('url', '')
         poi_name = poi.get('name', '')
         
-        # GEO instrumentation  
-        city_slug = poi.get('city_slug', 'paris')  # Fallback to paris if no city_slug
-        poi_coords = None
-        if poi.get('lat') is not None and poi.get('lng') is not None:
-            poi_coords = (poi['lat'], poi['lng'])
-        geo_audit = geo_hint_detailed(candidate['title'], candidate['snippet'], candidate['url'], city_slug, poi_coords, config)
+        # Simple geo audit
+        geo_audit = {
+            'score': explain['components']['geo_score'] if explain else 0.0,
+            'signals_found': [],
+            'components': {},
+            'reason': 'simplified_audit'
+        }
         
-        # NAME instrumentation
-        article_text = candidate['title'] + " " + candidate['snippet']
-        name_audit = name_match_detailed(poi_name, article_text)
+        # Simple name audit
+        name_audit = {
+            'score': explain['components']['name_match'] if explain else 0.0,
+            'poi_norm': poi_name.lower(),
+            'text_norm': (candidate['title'] + " " + candidate['snippet']).lower(),
+            'exact_substring': poi_name.lower() in (candidate['title'] + " " + candidate['snippet']).lower(),
+            'trigram_score': 0.0,
+            'fuzzy_score': 0.0,
+            'token_overlap': {'poi_tokens': [], 'text_tokens': [], 'overlap': []},
+            'normalization_warning': False
+        }
         
         # Authority analysis
         from .domains import domain_of
@@ -1403,6 +1019,11 @@ def main():
     
     # Misc options
     parser.add_argument('--allow-no-cse', action='store_true', help='Allow running without CSE')
+    parser.add_argument('--cse-num', type=int, help='Number of CSE results (default 30, max 50)')
+    parser.add_argument('--category', default='restaurant', help='POI category fallback (default: restaurant)')
+    parser.add_argument('--time-decay', action='store_true', help='Enable time decay scoring based on published_at dates')
+    parser.add_argument('--no-time-decay', dest='time_decay', action='store_false', help='Disable time decay scoring (default)')
+    parser.set_defaults(time_decay=None)  # None means use config default
     
     args = parser.parse_args()
     
@@ -1417,7 +1038,8 @@ def main():
         scanner = GattoMentionScanner(
             debug=args.debug,
             allow_no_cse=args.allow_no_cse,
-            jsonl_out=args.jsonl_out
+            jsonl_out=args.jsonl_out,
+            cli_args=args
         )
         
         # Parse POI names
@@ -1436,7 +1058,8 @@ def main():
             results = scanner.scan_open_mode(
                 poi_names=poi_names,
                 city_slug=args.city_slug,
-                limit_per_poi=args.limit_per_poi
+                limit_per_poi=args.limit_per_poi,
+                category=args.category
             )
             
         elif args.mode == 'serp-only':
@@ -1456,14 +1079,16 @@ def main():
                 poi_names=poi_names,
                 source_ids=source_ids,
                 city_slug=args.city_slug,
-                limit_per_poi=args.limit_per_poi
+                limit_per_poi=args.limit_per_poi,
+                category=args.category
             )
             
         else:  # balanced mode (default)
             results = scanner.scan_balanced_mode(
                 poi_names=poi_names,
                 city_slug=args.city_slug,
-                limit_per_poi=args.limit_per_poi
+                limit_per_poi=args.limit_per_poi,
+                category=args.category
             )
         
         # Print results

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Google Places API Ingester - Sprint 2 V2
-Enhanced version with Token Bucket, Field Masks, Tier & TTL, and Smart Snapshots.
+Google Places API Ingester - KISS Refactor
+Minimal, idempotent Google Places ingester with categories+subcategories, snapshots only, no legacy fields.
 """
 import sys
 import os
@@ -9,7 +9,8 @@ import logging
 import requests
 import json
 import time
-from typing import List, Dict, Any, Optional
+import re
+from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, date, timezone, timedelta
 from decimal import Decimal
 from unittest.mock import patch, MagicMock
@@ -23,8 +24,14 @@ import config
 # Global logger - level will be set by CLI args
 logger = logging.getLogger(__name__)
 
+# KISS V1 Configuration
+ALLOWED_GOOGLE_TYPES = {'restaurant', 'bar', 'cafe', 'bakery'}
+DEFAULT_RATING_MIN = 4.3
+DEFAULT_MIN_REVIEWS = 50
+DEFAULT_ENABLE_DETAILS_FOR_HOLD = False
+
 class GooglePlacesIngesterV2:
-    """Sprint 2: Google Places Ingester with Token Bucket, Field Masks, Tier & TTL"""
+    """KISS Google Places Ingester with categories+subcategories, rating snapshots only"""
     
     def __init__(self, dry_run: bool = False, mock_mode: bool = False):
         self.dry_run = dry_run
@@ -46,20 +53,31 @@ class GooglePlacesIngesterV2:
             self.db = None
             self.api_key = 'mock-api-key'
         
+        # Configuration from config.json or env vars
+        try:
+            import json
+            with open('config.json', 'r') as f:
+                config_data = json.load(f)
+            google_config = config_data.get('google_ingester', {})
+        except Exception:
+            google_config = {}
+        
+        self.rating_snapshot_days_interval = google_config.get('rating_snapshot', {}).get('days_interval', 7)
+        self.photo_max_width = google_config.get('photo', {}).get('max_width', 1024)
+        self.category_map = google_config.get('category_map', {})
+        self.subcategory_map = google_config.get('subcategory_map', {})
+        
         # Token Bucket Configuration (env vars with defaults)
         self.daily_tokens = int(os.environ.get('PLACES_DAILY_TOKENS', '5000'))
         self.reset_hour_utc = int(os.environ.get('PLACES_RESET_HOUR_UTC', '0'))
         self.basic_cost_per_1000 = float(os.environ.get('PLACES_BASIC_COST_PER_1000', '17.0'))
         self.contact_cost_per_1000 = float(os.environ.get('PLACES_CONTACT_COST_PER_1000', '3.0'))
         
-        # Snapshot freshness policy
-        self.snapshot_max_age_days = int(os.environ.get('SNAPSHOT_MAX_AGE_DAYS', '7'))
-        
         # Initialize token counters
         self._init_token_bucket()
         
-        # Field Masks - optimized for cost
-        self.basic_fields = 'place_id,name,geometry,formatted_address,types,rating,user_ratings_total,opening_hours,price_level,url'
+        # Field Masks - optimized for cost but comprehensive
+        self.basic_fields = 'place_id,name,geometry,formatted_address,types,rating,user_ratings_total,opening_hours,price_level,address_components,photos,website,international_phone_number'
         self.contact_fields = 'website,international_phone_number'
         
         # Counters for summary
@@ -69,6 +87,11 @@ class GooglePlacesIngesterV2:
         if not self.api_key and not mock_mode:
             logger.error("Google Places API key not configured")
             sys.exit(1)
+        
+        # KISS V1 Quality thresholds from config
+        self.rating_min = google_config.get('quality', {}).get('rating_min', DEFAULT_RATING_MIN)
+        self.min_reviews = google_config.get('quality', {}).get('min_reviews', DEFAULT_MIN_REVIEWS)
+        self.enable_details_for_hold = google_config.get('quality', {}).get('enable_details_for_hold', DEFAULT_ENABLE_DETAILS_FOR_HOLD)
     
     def _init_token_bucket(self):
         """Initialize token bucket with daily reset logic"""
@@ -110,6 +133,29 @@ class GooglePlacesIngesterV2:
         
         logger.debug(f"Token consumed for {call_type} call. Remaining: {self.tokens_remaining}")
         return True
+    
+    def is_type_allowed(self, types: List[str]) -> bool:
+        """Check if POI types intersect with allowed types"""
+        if not types:
+            return False
+        return bool(set(types) & ALLOWED_GOOGLE_TYPES)
+    
+    def pass_quality_gate(self, rating: Optional[float], count: Optional[int]) -> bool:
+        """Check if POI passes quality thresholds"""
+        if rating is None or count is None:
+            return False
+        return rating >= self.rating_min and count >= self.min_reviews
+    
+    def get_primary_category(self, types: List[str]) -> Optional[str]:
+        """Extract primary category from Google types"""
+        for google_type in types:
+            if google_type in ALLOWED_GOOGLE_TYPES:
+                return google_type
+        return None
+    
+    def filter_subcategories(self, types: List[str], primary_category: str) -> List[str]:
+        """Get subcategories as raw Google types minus primary"""
+        return [t for t in types if t != primary_category and t not in ['establishment', 'point_of_interest']]
     
     def get_cost_estimate(self) -> Dict[str, Any]:
         """Get current cost estimate and usage stats"""
@@ -178,98 +224,60 @@ class GooglePlacesIngesterV2:
             logger.error(f"Failed to get details for place {place_id}: {e}")
             return None
     
-    def _determine_poi_tier(self, poi: Dict[str, Any]) -> str:
-        """Determine POI tier based on first_seen_at"""
-        first_seen = poi.get('first_seen_at')
-        if not first_seen:
-            return 'A'  # New POI defaults to Tier A
-        
-        try:
-            first_seen_dt = datetime.fromisoformat(first_seen.replace('Z', '+00:00'))
-            days_since_first_seen = (datetime.now(timezone.utc) - first_seen_dt).days
-            
-            if days_since_first_seen < 7:
-                return 'A'
-            else:
-                return 'B'
-                # Tier C reserved for future use (720h TTL)
-        except Exception:
-            return 'A'  # Default on error
-    
-    def _is_poi_fresh(self, poi_id: str, tier: str) -> bool:
-        """Check if POI data is fresh based on tier TTL"""
-        try:
-            result = self.db.client.table('poi').select('updated_at').eq('id', poi_id).execute()
-            if not result.data:
-                return False
-            
-            updated_at = result.data[0].get('updated_at')
-            if not updated_at:
-                return False
-            
-            updated_dt = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
-            hours_since_update = (datetime.now(timezone.utc) - updated_dt).total_seconds() / 3600
-            
-            # TTL hours by tier
-            ttl_hours = {'A': 24, 'B': 168, 'C': 720}
-            
-            return hours_since_update < ttl_hours.get(tier, 24)
-            
-        except Exception as e:
-            logger.warning(f"Error checking freshness for POI {poi_id}: {e}")
-            return False
+    # Removed _determine_poi_tier and _is_poi_fresh methods - no longer needed with simplified logic
     
     def revalidate_light(self, poi_id: str, include_contact: bool = False) -> Dict[str, Any]:
-        """SWR light revalidation - refresh stale POIs"""
+        """Light revalidation - refresh POI data and create snapshot if needed"""
         try:
             # Get current POI data
-            result = self.db.client.table('poi').select('*').eq('id', poi_id).execute()
+            result = self.db.client.table('poi').select('google_place_id,last_ingested_from_google_at').eq('id', poi_id).execute()
             if not result.data:
                 return {'refreshed': False, 'error': 'POI not found'}
             
             poi = result.data[0]
-            tier = self._determine_poi_tier(poi)
-            
-            # Check if refresh needed
-            if self._is_poi_fresh(poi_id, tier):
-                return {
-                    'refreshed': False,
-                    'fields_fetched': [],
-                    'snapshot_created': False,
-                    'cost_estimate_increment': 0.0,
-                    'reason': 'still_fresh'
-                }
-            
-            # Refresh needed - fetch new data
             google_place_id = poi.get('google_place_id')
             if not google_place_id:
                 return {'refreshed': False, 'error': 'No google_place_id'}
             
+            # Check if refresh needed (simple 24h check)
+            last_ingested = poi.get('last_ingested_from_google_at')
+            if last_ingested:
+                try:
+                    last_ingested_dt = datetime.fromisoformat(last_ingested.replace('Z', '+00:00'))
+                    hours_since = (datetime.now(timezone.utc) - last_ingested_dt).total_seconds() / 3600
+                    if hours_since < 24:
+                        return {
+                            'refreshed': False,
+                            'fields_fetched': [],
+                            'snapshot_created': False,
+                            'reason': 'still_fresh'
+                        }
+                except Exception:
+                    pass  # Proceed with refresh if date parsing fails
+            
+            # Fetch new data
             new_data = self.get_place_details(google_place_id, include_contact)
             if not new_data:
                 return {'refreshed': False, 'error': 'API call failed'}
             
-            # Update POI data
-            update_fields = {
-                'rating': new_data.get('rating'),
-                'reviews_count': new_data.get('user_ratings_total'),
-                'rating_last_seen_at': datetime.now(timezone.utc).isoformat() if new_data.get('rating') else None,
-                'updated_at': datetime.now(timezone.utc).isoformat()
-            }
+            # Convert to POI format
+            poi_data = self.convert_place_data(new_data)
+            if not poi_data:
+                return {'refreshed': False, 'error': 'Failed to convert place data'}
             
-            if include_contact:
-                update_fields['website'] = new_data.get('website')
-                update_fields['phone'] = new_data.get('international_phone_number')
+            # Update POI with identity+display fields only
+            update_fields = {k: v for k, v in poi_data.items() if k != 'google_place_id'}
+            
+            # Extract rating for snapshot logic
+            current_rating = new_data.get('rating')
+            current_reviews = new_data.get('user_ratings_total')
             
             # Check if rating snapshot needed
-            snapshot_created = self._needs_rating_snapshot(
-                poi_id, 
-                new_data.get('rating'), 
-                new_data.get('user_ratings_total')
-            )
-            
-            if snapshot_created:
-                self._create_rating_snapshot(poi_id, new_data.get('rating'), new_data.get('user_ratings_total'))
+            snapshot_created = False
+            if current_rating is not None or current_reviews is not None:
+                snapshot_created = self._needs_rating_snapshot(poi_id, current_rating, current_reviews)
+                if snapshot_created:
+                    self._create_rating_snapshot(poi_id, current_rating, current_reviews)
             
             # Update POI
             self.db.client.table('poi').update(update_fields).eq('id', poi_id).execute()
@@ -278,7 +286,7 @@ class GooglePlacesIngesterV2:
             call_type = 'contact' if include_contact else 'basic'
             cost_per_call = (self.contact_cost_per_1000 if call_type == 'contact' else self.basic_cost_per_1000) / 1000.0
             
-            fields_fetched = ['rating', 'reviews_count']
+            fields_fetched = ['identity', 'display']
             if include_contact:
                 fields_fetched.extend(['website', 'phone'])
             
@@ -293,8 +301,101 @@ class GooglePlacesIngesterV2:
             logger.error(f"Error in revalidate_light for POI {poi_id}: {e}")
             return {'refreshed': False, 'error': str(e)}
     
+    def map_category(self, types: List[str]) -> Tuple[Optional[str], List[str]]:
+        """Map Google types to category and subcategories using KISS static mappings"""
+        
+        # Use configured mappings with fallbacks
+        parent_map = self.category_map if self.category_map else {
+            'restaurant': 'restaurant',
+            'bar': 'bar', 
+            'cafe': 'cafe',
+            'bakery': 'bakery',
+            'night_club': 'bar',
+            'food_court': 'restaurant',
+            'meal_takeaway': 'restaurant',
+            'meal_delivery': 'restaurant'
+        }
+        
+        subcat_map = self.subcategory_map if self.subcategory_map else {
+            'italian_restaurant': 'restaurant italien',
+            'french_restaurant': 'restaurant français',
+            'lebanese_restaurant': 'restaurant libanais',
+            'japanese_restaurant': 'restaurant japonais',
+            'chinese_restaurant': 'restaurant chinois',
+            'indian_restaurant': 'restaurant indien',
+            'thai_restaurant': 'restaurant thaï',
+            'mexican_restaurant': 'restaurant mexicain',
+            'seafood_restaurant': 'restaurant de fruits de mer',
+            'pizza_restaurant': 'pizzeria',
+            'wine_bar': 'bar à vins',
+            'cocktail_bar': 'bar à cocktails',
+            'sports_bar': 'bar sportif',
+            'coffee_shop': 'café',
+            'tea_house': 'salon de thé',
+            'bakery': 'boulangerie',
+            'pastry_shop': 'pâtisserie',
+            'ice_cream_shop': 'glacier',
+            'fast_food_restaurant': 'fast food',
+            'vegetarian_restaurant': 'restaurant végétarien',
+            'vegan_restaurant': 'restaurant végan'
+        }
+        
+        # Find parent category (first match)
+        category = None
+        for google_type in types:
+            if google_type in parent_map:
+                category = parent_map[google_type]
+                break
+        
+        # Build subcategories list
+        subcategories = []
+        for google_type in types:
+            if google_type in subcat_map:
+                subcategories.append(subcat_map[google_type])
+        
+        # Deduplicate and limit to 5
+        subcategories = list(dict.fromkeys(subcategories))[:5]
+        
+        return category, subcategories
+    
+    def extract_address_components(self, place: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+        """Extract city and country from address_components"""
+        try:
+            address_components = place.get('address_components', [])
+            city = None
+            country = None
+            
+            for component in address_components:
+                types = component.get('types', [])
+                long_name = component.get('long_name')
+                
+                # Extract city (locality or postal_town)
+                if ('locality' in types or 'postal_town' in types) and not city:
+                    city = long_name
+                
+                # Extract country
+                if 'country' in types and not country:
+                    country = long_name
+            
+            return city, country
+        except Exception as e:
+            logger.warning(f"Error extracting address components: {e}")
+            return None, None
+    
+    def build_photo_url(self, photo_reference: str) -> Optional[str]:
+        """Build Google Photos API URL with maxwidth"""
+        if not photo_reference or not self.api_key:
+            return None
+        
+        try:
+            url = f"https://maps.googleapis.com/maps/api/place/photo?maxwidth={self.photo_max_width}&photoreference={photo_reference}&key={self.api_key}"
+            return url
+        except Exception as e:
+            logger.warning(f"Error building photo URL: {e}")
+            return None
+    
     def convert_place_data(self, result: Dict[str, Any], city_slug: str = None) -> Optional[Dict[str, Any]]:
-        """Convert Google Places API result to POI format"""
+        """Convert Google Places API result to minimal POI format (identity+display only)"""
         try:
             place_id = result.get('place_id')
             name = result.get('name')
@@ -311,38 +412,100 @@ class GooglePlacesIngesterV2:
             if not lat or not lng:
                 return None
             
-            # Map Google types to our categories
+            # Map Google types to category and subcategories (KISS V1: store raw types)
             types = result.get('types', [])
-            category = self._map_google_type_to_category(types)
+            category, mapped_subcategories = self.map_category(types)
+            
+            # KISS V1: Store raw Google types as subcategories (minus primary and common ones)
+            subcategories = [t for t in types if t not in ['establishment', 'point_of_interest'] and t != category]
             
             if not category:
                 return None  # Skip if no matching category
             
-            # Extract city from formatted_address or use provided city_slug
-            formatted_address = result.get('formatted_address', '')
-            if city_slug:
-                city = city_slug
+            # Extract city and country from address_components
+            city, country = self.extract_address_components(result)
+            
+            # Fallback for city using city_slug or formatted_address
+            if not city:
+                if city_slug:
+                    city = city_slug
+                else:
+                    city = self._extract_city_from_address(result.get('formatted_address', ''))
+            
+            # Fallback for country if not found in address_components
+            if not country:
+                formatted_address = result.get('formatted_address', '')
+                if 'France' in formatted_address:
+                    country = 'France'
+                elif 'Paris' in formatted_address:
+                    country = 'France'  # Assume Paris = France
+                else:
+                    country = 'Unknown'  # Default fallback
+            
+            # Build city_slug (use resolver if present, otherwise slugify)
+            if hasattr(self, '_resolve_city_slug'):
+                city_slug_resolved = self._resolve_city_slug(city)
             else:
-                city = self._extract_city_from_address(formatted_address)
+                city_slug_resolved = city.lower().replace(' ', '_').replace('-', '_') if city else None
+            
+            # Handle price_level mapping (0-4 -> enum)
+            price_level = result.get('price_level')
+            price_level_mapped = self._convert_price_level(price_level) if price_level is not None else None
+            
+            # Extract opening hours as jsonb (truncate if too long)
+            opening_hours = result.get('opening_hours')
+            opening_hours_jsonb = None
+            if opening_hours:
+                opening_hours_str = json.dumps(opening_hours)
+                # Truncate to 500 chars if needed (database limit)
+                if len(opening_hours_str) > 500:
+                    opening_hours_jsonb = opening_hours_str[:497] + '...'
+                else:
+                    opening_hours_jsonb = opening_hours_str
+            
+            # Handle primary photo (KISS V1: only store reference, not URL)
+            photos = result.get('photos', [])
+            primary_photo_ref = None
+            if photos:
+                first_photo = photos[0]
+                photo_ref = first_photo.get('photo_reference')
+                if photo_ref:
+                    primary_photo_ref = photo_ref
+            
+            # Truncate fields that might be too long
+            address_street = result.get('formatted_address', '')
+            if len(address_street) > 500:
+                address_street = address_street[:497] + '...'
+            
+            website = result.get('website', '')
+            if website and len(website) > 500:
+                website = website[:497] + '...'
+            
+            phone = result.get('international_phone_number', '')
+            if phone and len(phone) > 50:
+                phone = phone[:47] + '...'
+            
+            # Ensure all fields are properly truncated
+            if primary_photo_ref and len(primary_photo_ref) > 500:
+                primary_photo_ref = primary_photo_ref[:500]
             
             poi_data = {
                 'google_place_id': place_id,
-                'name': name,
-                'category': category,
+                'name': name[:255] if name else name,  # Truncate name if too long
+                'city': city[:100] if city else city,  # Truncate city
+                'country': country[:100] if country else country,  # Truncate country
+                'city_slug': city_slug_resolved[:100] if city_slug_resolved else city_slug_resolved,  # Truncate city_slug
+                'address_street': address_street,
                 'lat': float(lat),
                 'lng': float(lng),
-                'address_street': formatted_address,
-                'city': city,
-                'rating': result.get('rating'),
-                'reviews_count': result.get('user_ratings_total'),
-                'rating_last_seen_at': datetime.now(timezone.utc).isoformat() if result.get('rating') else None,
-                'price_level': None,  # Skip price_level for now due to enum mismatch
-                'website': result.get('website'),
-                'phone': result.get('international_phone_number'),
-                'opening_hours': json.dumps(result.get('opening_hours', {}).get('weekday_text', [])),
-                'eligibility_status': 'hold',  # New POIs start as 'hold'
-                'first_seen_at': datetime.now(timezone.utc).isoformat(),
-                'updated_at': datetime.now(timezone.utc).isoformat()
+                'website': website,
+                'phone': phone,
+                'category': category[:50] if category else category,  # Truncate category
+                'subcategories': subcategories[:5] if subcategories else subcategories,  # Limit subcategories
+                'price_level': price_level_mapped,
+                'opening_hours': opening_hours_jsonb,
+                'primary_photo_ref': primary_photo_ref,  # KISS V1: only photo reference, no URL
+                'last_ingested_from_google_at': datetime.now(timezone.utc).isoformat()
             }
             
             return poi_data
@@ -351,21 +514,174 @@ class GooglePlacesIngesterV2:
             logger.error(f"Error converting place data: {e}")
             return None
     
-    def _map_google_type_to_category(self, types: List[str]) -> Optional[str]:
-        """Map Google types to our categories"""
-        category_mapping = {
-            'restaurant': 'restaurant',
-            'bar': 'bar', 
-            'cafe': 'cafe',
-            'bakery': 'bakery',
-            'night_club': 'night_club'
-        }
+    def to_poi_row(self, search_result: Dict[str, Any], details_result: Optional[Dict[str, Any]] = None, city_slug: str = None) -> Optional[Dict[str, Any]]:
+        """Convert Google Search result + optional Details to POI row (KISS V1)"""
+        try:
+            place_id = search_result.get('place_id')
+            name = search_result.get('name')
+            
+            if not place_id or not name:
+                return None
+            
+            # Extract location
+            geometry = search_result.get('geometry', {})
+            location = geometry.get('location', {})
+            lat = location.get('lat')
+            lng = location.get('lng')
+            
+            if not lat or not lng:
+                return None
+            
+            # Check allowed types first
+            types = search_result.get('types', [])
+            if not self.is_type_allowed(types):
+                return None  # Skip if not in whitelist
+            
+            # Get primary category from allowed types
+            primary_category = self.get_primary_category(types)
+            if not primary_category:
+                return None
+            
+            # Get subcategories as raw Google types (minus primary)
+            subcategories = self.filter_subcategories(types, primary_category)
+            
+            # Extract city and country from address_components (prefer details if available)
+            result_to_parse = details_result if details_result else search_result
+            city, country = self.extract_address_components(result_to_parse)
+            
+            # Fallback for city
+            if not city:
+                if city_slug:
+                    city = city_slug
+                else:
+                    city = self._extract_city_from_address(search_result.get('formatted_address', ''))
+            
+            # Fallback for country
+            if not country:
+                formatted_address = search_result.get('formatted_address', '')
+                if 'France' in formatted_address or 'Paris' in formatted_address:
+                    country = 'France'
+                else:
+                    country = 'Unknown'
+            
+            # Build city_slug
+            city_slug_resolved = city.lower().replace(' ', '_').replace('-', '_') if city else 'unknown'
+            
+            # Extract fields from details if available, otherwise from search
+            source = details_result if details_result else search_result
+            
+            # Address
+            address_street = source.get('formatted_address', '')[:500]  # Truncate
+            
+            # Contact info (details only)
+            website = ''
+            phone = ''
+            if details_result:
+                website = details_result.get('website', '')[:500]
+                phone = details_result.get('international_phone_number', '')[:50]
+            
+            # Opening hours (details preferred)
+            opening_hours_jsonb = None
+            opening_hours = source.get('opening_hours')
+            if opening_hours and isinstance(opening_hours, dict):
+                # Build minimal but useful opening hours object
+                hours_obj = {
+                    'open_now': opening_hours.get('open_now', False)
+                }
+                # Add weekday_text if available (from details)
+                if 'weekday_text' in opening_hours:
+                    hours_obj['weekday_text'] = opening_hours['weekday_text'][:7]  # Max 7 days
+                
+                opening_hours_str = json.dumps(hours_obj)
+                if len(opening_hours_str) <= 500:
+                    opening_hours_jsonb = opening_hours_str
+            
+            # Primary photo reference (no URL generation)
+            primary_photo_ref = None
+            photos = source.get('photos', [])
+            if photos and len(photos) > 0:
+                primary_photo_ref = photos[0].get('photo_reference')
+                # Truncate photo reference if too long
+                if primary_photo_ref and len(primary_photo_ref) > 500:
+                    primary_photo_ref = primary_photo_ref[:500]
+            
+            poi_data = {
+                'google_place_id': place_id,
+                'name': name[:255],  # Truncate
+                'category': primary_category,
+                'address_street': address_street[:500] if address_street else address_street,  # Ensure truncation
+                'city': city[:100] if city else city,  # Truncate city
+                'country': country[:100] if country else country,  # Truncate country
+                'lat': float(lat),
+                'lng': float(lng),
+                'opening_hours': opening_hours_jsonb,
+                'phone': phone[:50] if phone else phone,  # Ensure phone truncation
+                'website': website[:500] if website else website,  # Ensure website truncation
+                'primary_photo_ref': primary_photo_ref,
+                'eligibility_status': 'hold',  # V1: always hold
+                'subcategories': subcategories[:5] if subcategories else subcategories,  # Limit subcategories
+                'last_ingested_from_google_at': datetime.now(timezone.utc).isoformat()
+            }
+            
+            return poi_data
+            
+        except Exception as e:
+            logger.error(f"Error converting place data: {e}")
+            return None
+    
+    def upsert_poi(self, row: Dict[str, Any]) -> Optional[str]:
+        """Upsert POI and return poi_id"""
+        try:
+            google_place_id = row.get('google_place_id')
+            if not google_place_id:
+                return None
+            
+            # Check if POI already exists
+            result = self.db.client.table('poi')\
+                .select('id')\
+                .eq('google_place_id', google_place_id)\
+                .execute()
+            
+            if result.data:
+                # Update existing POI
+                poi_id = result.data[0]['id']
+                update_data = row.copy()
+                del update_data['google_place_id']  # Don't update the key
+                
+                self.db.client.table('poi').update(update_data).eq('id', poi_id).execute()
+                logger.debug(f"poi_updated: {row.get('name')} (id: {poi_id})")
+                return poi_id
+            else:
+                # Insert new POI
+                insert_result = self.db.client.table('poi').insert(row).execute()
+                if insert_result.data:
+                    poi_id = insert_result.data[0]['id']
+                    logger.debug(f"poi_created: {row.get('name')} (id: {poi_id})")
+                    return poi_id
+                return None
         
-        for google_type in types:
-            if google_type in category_mapping:
-                return category_mapping[google_type]
-        
-        return None  # Ignore other types
+        except Exception as e:
+            logger.error(f"Error upserting POI: {e}")
+            return None
+    
+    def insert_rating_snapshot(self, poi_id: str, rating: float, count: int) -> None:
+        """Insert rating snapshot for POI"""
+        try:
+            snapshot_data = {
+                'poi_id': poi_id,
+                'source_id': 'google',
+                'rating_value': rating,
+                'reviews_count': count,
+                'captured_at': datetime.now(timezone.utc).isoformat()
+            }
+            
+            self.db.client.table('rating_snapshot').insert(snapshot_data).execute()
+            logger.debug(f"snapshot_created: poi_id={poi_id}, rating={rating}, reviews={count}")
+            
+        except Exception as e:
+            logger.error(f"Error creating rating snapshot: {e}")
+    
+    # Removed _map_google_type_to_category - replaced by map_category method
     
     def _extract_city_from_address(self, formatted_address: str) -> str:
         """Extract city from formatted address"""
@@ -379,8 +695,8 @@ class GooglePlacesIngesterV2:
         
         return 'Unknown'
     
-    def ingest_poi_to_db(self, poi_data: Dict[str, Any], allow_fuzzy_upsert: bool = False) -> Optional[str]:
-        """Upsert POI to database with first_seen_at preservation"""
+    def ingest_poi_to_db(self, poi_data: Dict[str, Any], allow_fuzzy_upsert: bool = False, place_data: Dict[str, Any] = None) -> Optional[str]:
+        """Minimal upsert POI (identity+display fields only, preserve Gatto scores)"""
         try:
             google_place_id = poi_data.get('google_place_id')
             
@@ -396,76 +712,68 @@ class GooglePlacesIngesterV2:
                 self.ingested_count += 1
                 return f"mock-{google_place_id}"
             
-            # Check if POI already exists by google_place_id (primary method)
+            # Check if POI already exists by google_place_id
             result = self.db.client.table('poi')\
-                .select('id, first_seen_at')\
+                .select('id')\
                 .eq('google_place_id', google_place_id)\
                 .execute()
             
+            # Extract rating for snapshot logic (not stored in poi table anymore)
+            # Use place_data if provided, otherwise try to get from original Google response
+            source_data = place_data if place_data else {}
+            current_rating = source_data.get('rating')
+            current_reviews = source_data.get('user_ratings_total')
+            
             if result.data:
-                # Update existing POI (preserve first_seen_at)
-                existing_poi = result.data[0]
-                poi_id = existing_poi['id']
+                # Update existing POI (only identity+display fields)
+                poi_id = result.data[0]['id']
                 
+                # Remove google_place_id from update (it's the key)
                 update_data = poi_data.copy()
-                update_data['first_seen_at'] = existing_poi['first_seen_at']  # Preserve original
-                del update_data['google_place_id']  # Don't update the key
+                if 'google_place_id' in update_data:
+                    del update_data['google_place_id']
                 
                 self.db.client.table('poi').update(update_data).eq('id', poi_id).execute()
                 
                 # Check if rating snapshot needed
-                snapshot_created = self._needs_rating_snapshot(
-                    poi_id, 
-                    poi_data.get('rating'), 
-                    poi_data.get('reviews_count')
-                )
+                snapshot_created = False
+                if current_rating is not None or current_reviews is not None:
+                    snapshot_created = self._needs_rating_snapshot(poi_id, current_rating, current_reviews)
+                    if snapshot_created:
+                        self._create_rating_snapshot(poi_id, current_rating, current_reviews)
                 
-                if snapshot_created:
-                    self._create_rating_snapshot(poi_id, poi_data.get('rating'), poi_data.get('reviews_count'))
-                
-                tier = self._determine_poi_tier(existing_poi)
-                cost_estimate = self.get_cost_estimate()
-                
-                logger.info(f"Updated POI: {poi_data['name']} | Tier: {tier} | Tokens: {cost_estimate['tokens_remaining']} | Cost: ${cost_estimate['estimate_usd']}")
-                logger.info(f"Snapshot: {'created' if snapshot_created else 'skipped (fresh)'}")
+                logger.info(f"poi_updated: {poi_data['name']} | snapshot: {'written' if snapshot_created else 'skipped'}")
                 self.ingested_count += 1
                 
                 return poi_id
             else:
                 # Fuzzy fallback: try to match by city_slug + name (if enabled)
                 fuzzy_poi_id = None
-                if allow_fuzzy_upsert and poi_data.get('city') and poi_data.get('name'):
+                if allow_fuzzy_upsert and poi_data.get('city_slug') and poi_data.get('name'):
                     fuzzy_result = self.db.client.table('poi')\
-                        .select('id, first_seen_at')\
-                        .eq('city', poi_data['city'])\
+                        .select('id')\
+                        .eq('city_slug', poi_data['city_slug'])\
                         .ilike('name', f"%{poi_data['name']}%")\
                         .execute()
                     
                     if fuzzy_result.data:
                         # Found fuzzy match - update instead of insert
-                        existing_poi = fuzzy_result.data[0]
-                        fuzzy_poi_id = existing_poi['id']
+                        fuzzy_poi_id = fuzzy_result.data[0]['id']
                         
                         update_data = poi_data.copy()
-                        update_data['first_seen_at'] = existing_poi['first_seen_at']  # Preserve original
+                        if 'google_place_id' in update_data:
+                            del update_data['google_place_id']
                         
                         self.db.client.table('poi').update(update_data).eq('id', fuzzy_poi_id).execute()
                         
                         # Check if rating snapshot needed
-                        snapshot_created = self._needs_rating_snapshot(
-                            fuzzy_poi_id, 
-                            poi_data.get('rating'), 
-                            poi_data.get('reviews_count')
-                        )
+                        snapshot_created = False
+                        if current_rating is not None or current_reviews is not None:
+                            snapshot_created = self._needs_rating_snapshot(fuzzy_poi_id, current_rating, current_reviews)
+                            if snapshot_created:
+                                self._create_rating_snapshot(fuzzy_poi_id, current_rating, current_reviews)
                         
-                        if snapshot_created:
-                            self._create_rating_snapshot(fuzzy_poi_id, poi_data.get('rating'), poi_data.get('reviews_count'))
-                        
-                        tier = self._determine_poi_tier(existing_poi)
-                        cost_estimate = self.get_cost_estimate()
-                        
-                        logger.info(f"Fuzzy Updated POI: {poi_data['name']} | Tier: {tier} | Tokens: {cost_estimate['tokens_remaining']} | Cost: ${cost_estimate['estimate_usd']}")
-                        logger.info(f"Snapshot: {'created' if snapshot_created else 'skipped (fresh)'}")
+                        logger.info(f"poi_updated (fuzzy): {poi_data['name']} | snapshot: {'written' if snapshot_created else 'skipped'}")
                         self.ingested_count += 1
                         
                         return fuzzy_poi_id
@@ -477,18 +785,12 @@ class GooglePlacesIngesterV2:
                     poi_id = insert_result.data[0]['id']
                     
                     # Create initial snapshot for new POI
-                    rating = poi_data.get('rating')
-                    reviews_count = poi_data.get('reviews_count')
                     snapshot_created = False
-                    if rating is not None and reviews_count is not None:
-                        self.create_google_snapshot(poi_id, rating, reviews_count)
+                    if current_rating is not None or current_reviews is not None:
+                        self._create_rating_snapshot(poi_id, current_rating, current_reviews)
                         snapshot_created = True
                     
-                    tier = 'A'  # New POIs are always Tier A
-                    cost_estimate = self.get_cost_estimate()
-                    
-                    logger.info(f"Created POI: {poi_data['name']} | Tier: {tier} | Tokens: {cost_estimate['tokens_remaining']} | Cost: ${cost_estimate['estimate_usd']}")
-                    logger.info(f"Snapshot: {'created' if snapshot_created else 'skipped (no data)'}")
+                    logger.info(f"poi_created: {poi_data['name']} | snapshot: {'written' if snapshot_created else 'skipped'}")
                     self.ingested_count += 1
                     
                     return poi_id
@@ -496,12 +798,12 @@ class GooglePlacesIngesterV2:
                 return None
                 
         except Exception as e:
-            logger.error(f"Error ingesting POI to DB: {e}")
+            logger.error(f"db_error: Error ingesting POI to DB: {e}")
             self.skipped_count += 1
             return None
     
     def get_latest_google_snapshot(self, poi_id: str) -> Optional[dict]:
-        """Get the latest Google rating snapshot for a POI"""
+        """Get the latest Google Maps rating snapshot for a POI"""
         try:
             result = self.db.client.table('rating_snapshot')\
                 .select('rating_value,reviews_count,captured_at')\
@@ -516,11 +818,11 @@ class GooglePlacesIngesterV2:
             return None
             
         except Exception as e:
-            logger.warning(f"Error getting latest Google snapshot for POI {poi_id}: {e}")
+            logger.warning(f"Error getting latest Google Maps snapshot for POI {poi_id}: {e}")
             return None
     
     def create_google_snapshot(self, poi_id: str, rating: float, reviews_count: int) -> None:
-        """Create a Google rating snapshot"""
+        """Create a Google Maps rating snapshot"""
         try:
             snapshot_data = {
                 'poi_id': poi_id,
@@ -533,36 +835,45 @@ class GooglePlacesIngesterV2:
             self.db.client.table('rating_snapshot').insert(snapshot_data).execute()
             
         except Exception as e:
-            logger.error(f"Error creating Google snapshot: {e}")
+            logger.error(f"Error creating Google Maps snapshot: {e}")
     
     def _needs_rating_snapshot(self, poi_id: str, current_rating: Optional[float], current_reviews: Optional[int]) -> bool:
-        """Check if rating snapshot is needed based on freshness policy"""
+        """Check if rating snapshot is needed based on simplified policy"""
         try:
-            # Get latest Google snapshot
+            # Don't create snapshot if no rating data
+            if current_rating is None and current_reviews is None:
+                return False
+            
+            # Get latest Google Maps snapshot
             latest_snapshot = self.get_latest_google_snapshot(poi_id)
             
             if not latest_snapshot:
                 return True  # First snapshot
             
-            # Check if snapshot is older than max age
+            # Check if snapshot is older than interval days
             captured_at_str = latest_snapshot.get('captured_at')
             if captured_at_str:
                 try:
                     captured_at = datetime.fromisoformat(captured_at_str.replace('Z', '+00:00'))
                     days_old = (datetime.now(timezone.utc) - captured_at).days
                     
-                    if days_old >= self.snapshot_max_age_days:
+                    if days_old >= self.rating_snapshot_days_interval:
                         return True  # Snapshot is stale
                 except Exception:
                     return True  # Error parsing date, create new snapshot
             else:
                 return True  # No captured_at date, create new snapshot
             
-            # Check if rating or reviews changed
+            # Check if rating changed significantly (>= 0.1) or reviews changed
             last_rating = latest_snapshot.get('rating_value')
             last_reviews = latest_snapshot.get('reviews_count')
             
-            rating_changed = current_rating != last_rating
+            rating_changed = False
+            if current_rating is not None and last_rating is not None:
+                rating_changed = abs(current_rating - last_rating) >= 0.1
+            elif current_rating != last_rating:  # One is None, other is not
+                rating_changed = True
+            
             reviews_changed = current_reviews != last_reviews
             
             return rating_changed or reviews_changed
@@ -572,9 +883,21 @@ class GooglePlacesIngesterV2:
             return False
     
     def _create_rating_snapshot(self, poi_id: str, rating: Optional[float], reviews_count: Optional[int]):
-        """Create rating snapshot using the new helper"""
-        if rating is not None and reviews_count is not None:
-            self.create_google_snapshot(poi_id, rating, reviews_count)
+        """Create rating snapshot with google_maps source"""
+        try:
+            snapshot_data = {
+                'poi_id': poi_id,
+                'source_id': 'google',  # Use google_maps as source_id
+                'rating_value': rating,
+                'reviews_count': reviews_count,
+                'captured_at': datetime.now(timezone.utc).isoformat()
+            }
+            
+            self.db.client.table('rating_snapshot').insert(snapshot_data).execute()
+            logger.debug(f"snapshot_written: poi_id={poi_id}, rating={rating}, reviews={reviews_count}")
+            
+        except Exception as e:
+            logger.error(f"Error creating rating snapshot: {e}")
     
     def search_places_textsearch(self, query: str, location: str = None) -> List[Dict[str, Any]]:
         """Search places using Google Places Text Search API"""
@@ -626,13 +949,16 @@ class GooglePlacesIngesterV2:
             return []
     
     def run_seed_ingestion(self, city_slug: str = 'paris', neighborhood: str = None, category: str = None, limit: int = None) -> Dict[str, Any]:
-        """Run seed ingestion for city/neighborhood/category"""
-        logger.info(f"Starting seed ingestion: city={city_slug}, neighborhood={neighborhood}, category={category}, limit={limit}")
+        """Run KISS V1 seed ingestion with economic Details calls"""
+        logger.info(f"🔍 KISS V1 Ingestion: city={city_slug}, rating≥{self.rating_min}, reviews≥{self.min_reviews}")
         
-        categories = [category] if category else ['restaurant', 'bar', 'cafe', 'bakery', 'night_club']
+        # Only process allowed types (whitelist)
+        categories = [category] if category else list(ALLOWED_GOOGLE_TYPES)
         neighborhoods = [neighborhood] if neighborhood else ['1er arrondissement', '2ème arrondissement']
         
         total_processed = 0
+        quality_passed = 0
+        details_calls_saved = 0
         
         for cat in categories:
             for neigh in neighborhoods:
@@ -649,11 +975,43 @@ class GooglePlacesIngesterV2:
                     places_to_process = places[:min(5, remaining)]
                 
                 for place in places_to_process:
-                    poi_data = self.convert_place_data(place, city_slug=city_slug)
+                    # Filter by allowed types first
+                    types = place.get('types', [])
+                    if not self.is_type_allowed(types):
+                        logger.debug(f"Skipped {place.get('name', 'unknown')}: type not in whitelist")
+                        self.skipped_count += 1
+                        continue
+                    
+                    # Check quality gate from search data
+                    rating = place.get('rating')
+                    reviews_count = place.get('user_ratings_total')
+                    passes_quality = self.pass_quality_gate(rating, reviews_count)
+                    
+                    # Convert search result to POI (no details yet)
+                    poi_data = self.to_poi_row(place, details_result=None, city_slug=city_slug)
+                    if not poi_data:
+                        self.skipped_count += 1
+                        continue
+                    
+                    # Only get Details for quality candidates OR if configured for hold POIs
+                    details_result = None
+                    if passes_quality or self.enable_details_for_hold:
+                        details_result = self.get_place_details(place.get('place_id'), include_contact=True)
+                        if details_result:
+                            # Update POI data with details
+                            poi_data = self.to_poi_row(place, details_result, city_slug=city_slug)
+                    else:
+                        details_calls_saved += 1
+                        logger.debug(f"💰 Details call saved for {place.get('name', 'unknown')} (rating={rating}, reviews={reviews_count})")
+                    
                     if poi_data:
-                        poi_id = self.ingest_poi_to_db(poi_data)
+                        # Pass the rating data for snapshot creation
+                        source_data = details_result if details_result else place
+                        poi_id = self.ingest_poi_to_db(poi_data, place_data=source_data)
                         if poi_id:
                             total_processed += 1
+                            if passes_quality:
+                                quality_passed += 1
                         else:
                             self.skipped_count += 1
                     else:
@@ -667,18 +1025,22 @@ class GooglePlacesIngesterV2:
         
         cost_estimate = self.get_cost_estimate()
         
-        # Log final summary as JSON
+        # Enhanced summary with savings
         summary = {
             "ingested": self.ingested_count,
+            "quality_passed": quality_passed,
             "skipped": self.skipped_count,
+            "details_calls_saved": details_calls_saved,
             "cost_estimate": f"${cost_estimate['estimate_usd']}",
             "tokens_left": cost_estimate['tokens_remaining']
         }
-        logger.info(f"Seed ingestion summary: {json.dumps(summary)}")
+        logger.info(f"KISS V1 summary: {json.dumps(summary)}")
         
         return {
             'total_ingested': self.ingested_count,
+            'quality_passed': quality_passed,
             'total_skipped': self.skipped_count,
+            'details_calls_saved': details_calls_saved,
             'cost_estimate': cost_estimate
         }
     
@@ -721,7 +1083,7 @@ class GooglePlacesIngesterV2:
                 self._print_poi_summary(poi_data)
             return {'success': True, 'dry_run': True, 'poi_data': poi_data}
         else:
-            poi_id = self.ingest_poi_to_db(poi_data, allow_fuzzy_upsert)
+            poi_id = self.ingest_poi_to_db(poi_data, allow_fuzzy_upsert, place_data=place_details)
             if poi_id:
                 if json_output:
                     self._output_json_upserted(poi_id, poi_data)
@@ -767,12 +1129,13 @@ class GooglePlacesIngesterV2:
         if price_level is None:
             return None
         
+        # Database enum values - check what values are actually accepted
         price_map = {
-            0: 'free',
-            1: 'inexpensive', 
-            2: 'moderate',
-            3: 'expensive',
-            4: 'very_expensive'
+            0: None,  # Free -> NULL (safer than 'free' if enum doesn't have it)
+            1: None,  # Inexpensive -> NULL temporarily
+            2: None,  # Moderate -> NULL temporarily 
+            3: None,  # Expensive -> NULL temporarily
+            4: None   # Very expensive -> NULL temporarily
         }
         return price_map.get(price_level, None)
     
@@ -944,7 +1307,7 @@ class GooglePlacesIngesterV2:
         for place in places[:limit]:
             poi_data = self.convert_place_data(place, city_slug=city_slug)
             if poi_data:
-                poi_id = self.ingest_poi_to_db(poi_data)
+                poi_id = self.ingest_poi_to_db(poi_data, place_data=place)
                 if not poi_id:
                     self.skipped_count += 1
             else:
@@ -1011,12 +1374,12 @@ def run_mock_tests():
         poi_data = ingester.convert_place_data(place_details)
         assert poi_data is not None
         assert poi_data['name'] == place_details['name']
-        assert poi_data['eligibility_status'] == 'hold'
+        assert poi_data['category'] is not None
         logger.info(f"✅ Test {test_count}: POI data conversion")
         
         # Test 6: Mock ingestion
         test_count += 1
-        poi_id = ingester.ingest_poi_to_db(poi_data)
+        poi_id = ingester.ingest_poi_to_db(poi_data, place_data=place_details)
         assert poi_id is not None
         assert ingester.ingested_count == 1
         logger.info(f"✅ Test {test_count}: Mock POI ingestion")

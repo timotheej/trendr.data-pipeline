@@ -119,7 +119,7 @@ def _rate_limit_delay(cfg) -> float:
     return DEFAULT_DELAY
 
 
-def resolve_config() -> Dict[str, Any]:
+def resolve_config(cli_args=None) -> Dict[str, Any]:
     """Single function that returns final config values (CLI > ENV > config > defaults) and logs them"""
     logger = logging.getLogger(__name__)
     
@@ -142,6 +142,11 @@ def resolve_config() -> Dict[str, Any]:
             'limits': {
                 'cse_num': 30
             },
+            'time_decay': {
+                'enabled': False,  # Default disabled
+                'tau_days': 90,    # Half-life in days
+                'max_age_days': 365  # Max age before 0 score
+            },
             'serp_only': {
                 'sources': []
             }
@@ -155,15 +160,26 @@ def resolve_config() -> Dict[str, Any]:
     if base_config:
         _deep_merge(final_config, base_config)
     
-    # Apply ENV overrides
-    if os.getenv('SCANNER_MODE'):
-        final_config['mention_scanner']['mode'] = os.getenv('SCANNER_MODE')
+    # Apply CLI overrides first (highest priority)
+    if cli_args and hasattr(cli_args, 'cse_num') and cli_args.cse_num:
+        cse_num = max(1, min(50, cli_args.cse_num))  # Clamp to 1..50 range
+        final_config['mention_scanner']['limits']['cse_num'] = cse_num
     
-    if os.getenv('CSE_NUM'):
+    if cli_args and hasattr(cli_args, 'time_decay') and cli_args.time_decay is not None:
+        final_config['mention_scanner']['time_decay']['enabled'] = cli_args.time_decay
+    
+    # Apply ENV overrides
+    elif os.getenv('CSE_NUM'):
         try:
-            final_config['mention_scanner']['limits']['cse_num'] = int(os.getenv('CSE_NUM'))
+            cse_num = int(os.getenv('CSE_NUM'))
+            # Clamp to 1..50 range
+            cse_num = max(1, min(50, cse_num))
+            final_config['mention_scanner']['limits']['cse_num'] = cse_num
         except ValueError:
             pass
+    
+    if os.getenv('SCANNER_MODE'):
+        final_config['mention_scanner']['mode'] = os.getenv('SCANNER_MODE')
     
     if os.getenv('THRESHOLD_HIGH'):
         try:
@@ -182,6 +198,7 @@ def resolve_config() -> Dict[str, Any]:
     logger.info("📋 RESOLVED CONFIG:")
     logger.info(f"  mode: {scanner_config['mode']}")
     logger.info(f"  limits.cse_num: {scanner_config['limits']['cse_num']}")
+    logger.info(f"  time_decay.enabled: {scanner_config['time_decay']['enabled']}")
     
     # Use match_score structure from config.json
     thresholds = scanner_config.get('match_score', {})

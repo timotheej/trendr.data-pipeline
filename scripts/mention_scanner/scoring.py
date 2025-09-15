@@ -12,15 +12,13 @@ from difflib import SequenceMatcher
 from typing import Dict, Any, Optional, Tuple, Union, List
 import logging
 
-# Try to import domains, matching, and city_profiles to avoid circular imports
+# Try to import domains and city_profiles to avoid circular imports
 try:
     from .domains import domain_of
-    from .matching import normalize
     from .city_profiles import city_manager
 except ImportError:
     try:
         from domains import domain_of
-        from matching import normalize
         from city_profiles import city_manager
     except ImportError:
         # Fallback - will need to import these functions when used
@@ -29,11 +27,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-# KISS - removed legacy regex patterns, time_decay, fuzzy_score functions
-
-# KISS - removed calculate_intelligent_name_score, _clean_for_exact_match, _is_exact_match_with_stopwords, name_match_detailed functions
-
-# KISS - removed geo_hint, geo_hint_detailed, cat_hint functions - use city_manager directly
+# KISS implementation with simplified functions
 
 def calculate_authority(domain: str, config: Optional[Dict[str, Any]] = None, 
                       db_manager: Optional[Any] = None) -> float:
@@ -63,12 +57,11 @@ def calculate_authority(domain: str, config: Optional[Dict[str, Any]] = None,
     # Return weight from domain_groups or fallback to 0.5
     return domain_groups.get(apex_domain, 0.5)
 
-# KISS - removed calculate_penalties function - penalties handled in KISS scoring
 
 def final_score(poi_name: str, title: str, snippet: str, url: str, 
                 poi_category: str, config: Optional[Dict[str, Any]] = None, debug: bool = False,
                 city_slug: str = 'paris', poi_coords: Optional[Tuple[float, float]] = None,
-                db_manager: Optional[Any] = None) -> Union[float, Tuple[float, Dict[str, Any]]]:
+                db_manager: Optional[Any] = None, published_at: Optional[str] = None) -> Union[float, Tuple[float, Dict[str, Any]]]:
     """KISS final score: fixed weights 0.60*name + 0.25*geo + 0.15*authority
     
     Returns:
@@ -98,7 +91,25 @@ def final_score(poi_name: str, title: str, snippet: str, url: str,
     
     # Apply penalties (country/city mismatch only)
     penalties = _calculate_kiss_penalties(poi_name, title, snippet, url, city_slug, config)
-    final_score_value = max(0.0, min(1.0, base_score - penalties['total']))
+    score_after_penalties = max(0.0, min(1.0, base_score - penalties['total']))
+    
+    # Apply time decay if enabled and published_at is available
+    time_decay_multiplier = 1.0
+    time_decay_info = {"enabled": False, "multiplier": 1.0, "age_days": None}
+    
+    if config and published_at:
+        time_decay_config = config.get('mention_scanner', {}).get('time_decay', {})
+        if time_decay_config.get('enabled', False):
+            decay_multiplier = _calculate_time_decay(published_at, time_decay_config)
+            if decay_multiplier is not None:
+                time_decay_multiplier = decay_multiplier
+                time_decay_info = {
+                    "enabled": True, 
+                    "multiplier": decay_multiplier,
+                    "age_days": _calculate_age_days(published_at)
+                }
+    
+    final_score_value = score_after_penalties * time_decay_multiplier
     
     if debug_enabled:
         explain = {
@@ -115,6 +126,8 @@ def final_score(poi_name: str, title: str, snippet: str, url: str,
                 'authority_component': round(weighted_authority, 3),
             },
             'base_score': round(base_score, 3),
+            'score_after_penalties': round(score_after_penalties, 3),
+            'time_decay': time_decay_info,
             'final_score': round(final_score_value, 3),
             'domain': domain
         }
@@ -330,3 +343,60 @@ def _detect_wrong_city_kiss(text: str, city_profile) -> bool:
         if city.lower() in text:
             return True
     return False
+
+
+def _calculate_time_decay(published_at: str, time_decay_config: Dict[str, Any]) -> Optional[float]:
+    """Calculate time decay multiplier based on published_at date
+    
+    Uses exponential decay: multiplier = exp(-age_days / tau_days)
+    Where tau_days is the half-life parameter
+    
+    Args:
+        published_at: ISO date string (e.g., "2024-03-15", "2024-03-15T12:00:00Z")
+        time_decay_config: Config dict with tau_days and max_age_days
+        
+    Returns:
+        float: Decay multiplier (0.0-1.0), or None if parsing fails
+    """
+    try:
+        # Parse different date formats
+        if 'T' in published_at:
+            # ISO with time: "2024-03-15T12:00:00Z" 
+            pub_date = datetime.fromisoformat(published_at.replace('Z', '+00:00'))
+        else:
+            # Date only: "2024-03-15"
+            pub_date = datetime.strptime(published_at, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+            
+        # Calculate age in days
+        now = datetime.now(timezone.utc)
+        age_days = (now - pub_date).days
+        
+        # Check max age limit
+        max_age = time_decay_config.get('max_age_days', 365)
+        if age_days > max_age:
+            return 0.0
+            
+        # Calculate exponential decay
+        tau_days = time_decay_config.get('tau_days', 90)
+        multiplier = math.exp(-age_days / tau_days)
+        
+        return max(0.0, min(1.0, multiplier))
+        
+    except Exception as e:
+        logger.debug(f"Time decay calculation failed for '{published_at}': {e}")
+        return None
+
+
+def _calculate_age_days(published_at: str) -> Optional[int]:
+    """Helper to calculate age in days from published_at string"""
+    try:
+        if 'T' in published_at:
+            pub_date = datetime.fromisoformat(published_at.replace('Z', '+00:00'))
+        else:
+            pub_date = datetime.strptime(published_at, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+            
+        now = datetime.now(timezone.utc)
+        return (now - pub_date).days
+        
+    except Exception:
+        return None

@@ -74,7 +74,7 @@ class TrendrPipelineOrchestrator:
         merged['dry_run'] = args.dry_run
         merged['fields'] = args.fields
         merged['serp_only'] = args.serp_only
-        merged['cse_num'] = args.cse_num  # No cap limit
+        # cse_num is now handled by config_resolver (CLI > ENV > config > defaults)
         merged['explain'] = args.explain
         merged['debug'] = args.debug
         
@@ -181,11 +181,13 @@ class TrendrPipelineOrchestrator:
                     skip_next = False
                     continue
                     
-                # Essential flags that mention scanner needs
-                if arg in ['--mode', '--city-slug', '--poi-name', '--cse-num', '--limit-per-poi']:
+                # Essential flags that KISS mention scanner supports
+                if arg in ['--mode', '--city-slug', '--poi-name', '--poi-names', '--sources', '--limit-per-poi']:
                     if i + 1 < len(original_cmd):
                         essential_cmd.extend([arg, original_cmd[i + 1]])
                         skip_next = True
+                elif arg in ['--debug', '--allow-no-cse']:
+                    essential_cmd.append(arg)
         else:
             # Fallback for old script invocation: python3 script.py
             essential_cmd = [original_cmd[0], original_cmd[1]]  # python3 script.py
@@ -342,25 +344,21 @@ class TrendrPipelineOrchestrator:
         
         cmd = ['python3','-m','scripts.mention_scanner',
                 '--mode', scan_mode,
-                '--city-slug', city,
-                '--cse-num', str(self.merged_params.get('cse_num',50))]
+                '--city-slug', city]
         
         # Add sources ONLY for serp-only mode
         # balanced mode uses source_catalog automatically, don't override with manual sources
         if scan_mode == 'serp-only' and (self.config.get('social_proof_config') or {}).get('sources'):
             cmd += ['--sources', ','.join(self.config['social_proof_config']['sources'])]
         
-        # Debug extras - always enable for seed pipeline to get visibility
+        # Debug extras - only use supported flags
         debug_mode = (logger.level == logging.DEBUG) or os.getenv("SCAN_DEBUG") == "1" or self.merged_params.get('debug', False)
         if debug_mode:
             cmd += [
                 '--debug',
-                '--log-drop-reasons',
-                '--jsonl-out', 'out/seed_scan.jsonl',
-                '--dump-serp', 'out/serp_dumps',
-                '--no-cache'
+                '--jsonl-out', 'out/seed_scan.jsonl'
             ]
-            os.makedirs('out/serp_dumps', exist_ok=True)
+            os.makedirs('out', exist_ok=True)
         
         if poi_name:
             if poi_id:
@@ -487,18 +485,17 @@ class TrendrPipelineOrchestrator:
             
         cmd = ['python3','-m','scripts.mention_scanner',
                 '--mode', scan_mode,
-                '--city-slug', city.lower(),
-                '--cse-num', str(self.merged_params.get('cse_num',50))]
+                '--city-slug', city.lower()]
         
         # Add sources ONLY for serp-only mode
         # balanced mode uses source_catalog automatically, don't override with manual sources
         if scan_mode == 'serp-only' and (self.config.get('social_proof_config') or {}).get('sources'):
             cmd += ['--sources', ','.join(self.config['social_proof_config']['sources'])]
             
-        # Debug options
+        # Debug options - only use supported flags
         debug_mode = (logger.level == logging.DEBUG) or self.merged_params.get('debug', False)
         if debug_mode:
-            cmd += ['--debug', '--log-drop-reasons']
+            cmd += ['--debug']
             
         return self.run_subprocess(cmd, 'MENTIONS')
     
@@ -639,7 +636,7 @@ Seed Pipeline (SEED → SCAN):
     
     # Mentions-specific arguments  
     parser.add_argument('--serp-only', action='store_true', help='Use only SERP API for mentions')
-    parser.add_argument('--cse-num', type=int, default=50, help='Number of CSE results (default 50, no max limit)')
+    parser.add_argument('--cse-num', type=int, default=30, help='Number of CSE results (default 30, max 50)')
     
     # Classification-specific arguments
     parser.add_argument('--explain', action='store_true', help='Show detailed score components in classification')

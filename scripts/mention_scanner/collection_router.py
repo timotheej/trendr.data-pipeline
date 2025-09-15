@@ -57,7 +57,11 @@ class CollectionRouter:
             return []
     
     def collect_from_catalog_filtered(self, poi: Dict[str, Any], sources: List[str]) -> List[Dict[str, Any]]:
-        """Collect from specified catalog sources only (serp-only mode)"""
+        """Collect from specified catalog sources only (serp-only mode)
+        
+        SERP-only mode = sources spécifiées uniquement via site: (pas de requêtes ouvertes)
+        Only queries sites/domains listed in sources using site: operator - no open CSE calls
+        """
         if not sources:
             logger.warning("No sources specified for filtered catalog collection")
             return []
@@ -107,7 +111,11 @@ class CollectionRouter:
         return candidates
     
     def _collect_from_cse_with_sites(self, poi: Dict[str, Any], domains: List[str]) -> List[Dict[str, Any]]:
-        """Collect from CSE with site: filtering"""
+        """Collect from CSE with site: filtering
+        
+        Used by SERP-only mode: no open CSE - site: only
+        Only searches within specified domains using site: operator
+        """
         if not self.cse_searcher or not domains:
             return []
             

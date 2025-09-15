@@ -188,6 +188,53 @@
     }
   },
 
+  "google_ingester": {
+    "quality": {
+      "rating_min": 4.3,
+      "min_reviews": 50,
+      "enable_details_for_hold": false
+    },
+    "rating_snapshot": {
+      "days_interval": 7
+    },
+    "photo": {
+      "max_width": 1024
+    },
+    "category_map": {
+      "restaurant": "restaurant",
+      "bar": "bar",
+      "cafe": "cafe",
+      "bakery": "bakery",
+      "night_club": "bar",
+      "food_court": "restaurant",
+      "meal_takeaway": "restaurant",
+      "meal_delivery": "restaurant"
+    },
+    "subcategory_map": {
+      "italian_restaurant": "restaurant italien",
+      "french_restaurant": "restaurant français",
+      "lebanese_restaurant": "restaurant libanais",
+      "japanese_restaurant": "restaurant japonais",
+      "chinese_restaurant": "restaurant chinois",
+      "indian_restaurant": "restaurant indien",
+      "thai_restaurant": "restaurant thaï",
+      "mexican_restaurant": "restaurant mexicain",
+      "seafood_restaurant": "restaurant de fruits de mer",
+      "pizza_restaurant": "pizzeria",
+      "wine_bar": "bar à vins",
+      "cocktail_bar": "bar à cocktails",
+      "sports_bar": "bar sportif",
+      "coffee_shop": "café",
+      "tea_house": "salon de thé",
+      "bakery": "boulangerie",
+      "pastry_shop": "pâtisserie",
+      "ice_cream_shop": "glacier",
+      "fast_food_restaurant": "fast food",
+      "vegetarian_restaurant": "restaurant végétarien",
+      "vegan_restaurant": "restaurant végan"
+    }
+  },
+
   "api_cost_optimization": {
     "use_basic_fields_only": true,
     "avoid_expensive_fields": [

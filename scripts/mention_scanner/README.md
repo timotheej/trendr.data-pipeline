@@ -7,6 +7,15 @@ KISS (Keep It Simple, Stupid) mention scanner with 3 simplified modes and fixed 
 - Strategy-based scanning, complex query builders, legacy match pipelines  
 - Multi-source resolvers, threshold resolution chains, experimental config loaders
 
+## 🆕 Récentes Améliorations
+
+**4 Patches KISS** (additifs seulement, pas de refonte) :
+
+1. **CSE Limite** : Défaut 30 résultats (max 50), CLI `--cse-num` avec clamp automatique
+2. **Catégorie Auto** : Résolution dynamique depuis base POI, fallback `--category`, fini le hardcode "restaurant"  
+3. **SERP-only Clarifié** : Documentation précise "site: uniquement, pas de requêtes ouvertes"
+4. **Time Decay** : Flag `--time-decay` optionnel, décroissance exp. sur `published_at` (désactivé par défaut)
+
 ## 📋 Prérequis
 
 Depuis la racine du repository :
@@ -20,7 +29,7 @@ export GOOGLE_CUSTOM_SEARCH_ENGINE_ID="votre_cx_id"
 ## 3 Modes (Simplified)
 
 ### balanced
-Sources: catalogue (toutes sources actives) + CSE (requêtes ouvertes)
+Catalogue actif + CSE ouverte
 - `collect_from_catalog_active_sources()` + `collect_from_cse()`
 
 ```bash
@@ -30,9 +39,9 @@ python -m scripts.mention_scanner \
   --city-slug paris
 ```
 
-### serp-only  
-Sources: sources spécifiées uniquement (aucune CSE)
-- `collect_from_catalog_filtered(sources=...)` - liste configurable, aucun appel CSE
+### serp-only
+Uniquement sites/domaines listés (via site:)
+- `collect_from_catalog_filtered(sources=...)` - pas de requêtes ouvertes
 
 ```bash
 python -m scripts.mention_scanner \
@@ -42,7 +51,7 @@ python -m scripts.mention_scanner \
 ```
 
 ### open
-Sources: CSE uniquement, sans sources catalogue
+CSE ouverte sans sources
 - `collect_from_cse()` seulement
 
 ```bash
@@ -61,7 +70,8 @@ Pas de filtre `site:.tld` par défaut.
 
 ## KISS Scoring
 ```
-final_score = 0.60*name + 0.25*geo + 0.15*authority (clamp 0–1)
+base_score = 0.60*name + 0.25*geo + 0.15*authority
+final_score = (base_score - penalties) * time_decay_multiplier (clamp 0–1)
 ```
 
 ### 3 Composantes
@@ -72,6 +82,11 @@ final_score = 0.60*name + 0.25*geo + 0.15*authority (clamp 0–1)
 ### 2 Pénalités
 - **country mismatch** → reject immédiat
 - **city mismatch** → -0.15 (clamp max_penalty)
+
+### Time Decay (Optionnel)
+- **Désactivé par défaut** - utilisez `--time-decay` pour activer
+- **Décroissance exponentielle**: `exp(-age_days / tau_days)` avec tau=90j
+- **Limite d'âge**: Articles > 365j → score = 0
 
 ## 🔧 Options CLI Détaillées
 
@@ -88,9 +103,17 @@ final_score = 0.60*name + 0.25*geo + 0.15*authority (clamp 0–1)
 ### Paramètres CSE
 
 ```bash
---cse-num 10                           # Nombre de résultats CSE (1-50)
+--cse-num 30                           # Nombre de résultats CSE (défaut 30, max 50)
 --no-cache                             # Désactiver le cache CSE
 --allow-no-cse                         # Permettre exécution sans CSE
+```
+
+### Catégorie et Scoring
+
+```bash
+--category restaurant                  # Catégorie POI fallback (défaut: restaurant)
+--time-decay                           # Activer décroissance temporelle sur published_at
+--no-time-decay                        # Désactiver décroissance temporelle (défaut)
 ```
 
 ### Seuils de Scoring
@@ -121,7 +144,8 @@ final_score = 0.60*name + 0.25*geo + 0.15*authority (clamp 0–1)
 
 - **Templates configurables** depuis `config.json`
 - **Variables disponibles** : `{poi_name}`, `{poi_name_normalized}`, `{city_name}`, `{category_synonym}`
-- **Catégorie obligatoire** : Toutes les requêtes incluent le type (restaurant, etc.)
+- **Catégorie auto** : Résolution depuis base POI, fallback CLI `--category` (défaut: restaurant)
+- **Catégorie obligatoire** : Toutes les requêtes incluent le type (restaurant, bar, etc.)
 
 ### 3. **Recherche CSE Géolocalisée**
 
@@ -225,6 +249,16 @@ Tous les paramètres sont configurables via `config.json` (aucun hardcodé) :
       "distance_full_threshold_km": 3,
       "distance_half_threshold_km": 15
     },
+    "limits": {
+      "cse_num": 30,
+      "poi_limit": 10,
+      "max_candidates_per_poi": 100
+    },
+    "time_decay": {
+      "enabled": false,
+      "tau_days": 90,
+      "max_age_days": 365
+    },
     "debug_mode": {
       "threshold_high": 0.3,
       "threshold_mid": 0.15,
@@ -275,15 +309,26 @@ python -m scripts.mention_scanner \
   --cse-num 15
 ```
 
-### Scan Multi-POI
+### Scan Multi-POI avec nouvelles fonctionnalités
 
 ```bash
+# Avec catégorie personnalisée et time decay
 python -m scripts.mention_scanner \
   --mode balanced \
   --poi-names "Septime,Le Chateaubriand,L'Astrance" \
   --city-slug paris \
-  --cse-num 10 \
+  --category restaurant \
+  --cse-num 45 \
+  --time-decay \
   --jsonl-out out/multi_poi.jsonl
+
+# Bar à vin avec limite CSE élevée  
+python -m scripts.mention_scanner \
+  --mode open \
+  --poi-name "Le Mary Celeste" \
+  --city-slug paris \
+  --category "bar à vin" \
+  --cse-num 50
 ```
 
 ### Debug Mode avec Seuils Abaissés

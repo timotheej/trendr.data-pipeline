@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
 POI Photo Processing Script
-Batch processes photos for POIs that don't have photos yet
-Can be run separately from main pipeline for photo backfill
+DEPRECATED: superseded by inline Google photo URL handling in google_places_ingester.py
+
+This module is no longer used and will be removed in a future version.
+Photo processing is now handled directly in the Google Places ingester using
+primary_photo_url and primary_photo_ref fields.
 """
 import sys
 import os

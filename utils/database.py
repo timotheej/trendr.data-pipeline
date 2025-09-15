@@ -813,7 +813,9 @@ class SupabaseManager:
 
     def upsert_source_mention_new(self, poi_id: str, url: str, excerpt: str, title: str, domain: str, 
                                  query: str, serp_position: int, final_score: float, score_components: dict,
-                                 source_id: str = None, discovered_source_id: str = None) -> bool:
+                                 source_id: str = None, discovered_source_id: str = None,
+                                 published_at: str = None, published_at_confidence: str = None, 
+                                 published_at_method: str = None) -> bool:
         """
         Upsert source mention supporting both cataloged sources and discovered sources
         
@@ -841,6 +843,9 @@ class SupabaseManager:
                 'serp_position': serp_position if serp_position is not None else None,
                 'final_score': final_score if final_score is not None else None,
                 'score_components': score_components if score_components else None,
+                'published_at': published_at,
+                # TODO: Add when columns exist - 'published_at_confidence': published_at_confidence,
+                # TODO: Add when columns exist - 'published_at_method': published_at_method,
                 'accepted': True,
                 'last_seen_at': datetime.utcnow().isoformat()
             }
@@ -865,6 +870,9 @@ class SupabaseManager:
                     'excerpt': mention_data['excerpt'],
                     'final_score': mention_data['final_score'], 
                     'score_components': mention_data['score_components'],
+                    'published_at': mention_data['published_at'],
+                    # TODO: Add when columns exist - 'published_at_confidence': mention_data['published_at_confidence'],
+                    # TODO: Add when columns exist - 'published_at_method': mention_data['published_at_method'],
                     'last_seen_at': mention_data['last_seen_at'],
                     'title': mention_data['title'],
                     'domain': mention_data['domain'],
