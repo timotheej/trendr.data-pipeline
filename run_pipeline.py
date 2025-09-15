@@ -422,6 +422,21 @@ class TrendrPipelineOrchestrator:
             logger.info(f"✅ POI ingested with ID: {poi_id}")
         if poi_name:
             logger.info(f"📝 POI name for mentions: {poi_name}")
+        
+        # Run spatial association for the newly inserted POI
+        if poi_id:
+            logger.info("🗺️ Running spatial association for new POI...")
+            try:
+                from scripts.associate_pois import update_poi_association
+                result = update_poi_association(poi_id)
+                if result.get('success'):
+                    district = result.get('district_name')
+                    neighbourhood = result.get('neighbourhood_name')
+                    logger.info(f"✅ Spatial association: {district or 'None'} / {neighbourhood or 'None'}")
+                else:
+                    logger.warning(f"⚠️ Spatial association failed: {result.get('error', 'Unknown error')}")
+            except Exception as e:
+                logger.warning(f"⚠️ Spatial association failed: {e}")
             
         # Step 2: Mention scanning
         logger.info("🔍 STEP 2: Mention Scanning")

@@ -301,6 +301,21 @@ class GooglePlacesIngesterV2:
             logger.error(f"Error in revalidate_light for POI {poi_id}: {e}")
             return {'refreshed': False, 'error': str(e)}
     
+    def map_urban_areas(self, lat: float, lng: float) -> Tuple[Optional[str], Optional[str]]:
+        """Map POI coordinates to urban areas (district + neighbourhood)"""
+        try:
+            if self.mock_mode:
+                return "16e Arrondissement", "Chaillot"
+            
+            # Fallback to post-processing association
+            # The spatial queries are complex and better handled by the SQL function
+            logger.debug(f"Deferring spatial association for coordinates ({lat}, {lng}) to post-processing")
+            return None, None
+            
+        except Exception as e:
+            logger.error(f"Error mapping urban areas for ({lat}, {lng}): {e}")
+            return None, None
+
     def map_category(self, types: List[str]) -> Tuple[Optional[str], List[str]]:
         """Map Google types to category and subcategories using KISS static mappings"""
         
@@ -412,6 +427,9 @@ class GooglePlacesIngesterV2:
             if not lat or not lng:
                 return None
             
+            # Map POI to urban areas (district + neighbourhood) - KISS method
+            district_name, neighbourhood_name = self.map_urban_areas(lat, lng)
+            
             # Map Google types to category and subcategories (KISS V1: store raw types)
             types = result.get('types', [])
             category, mapped_subcategories = self.map_category(types)
@@ -505,6 +523,9 @@ class GooglePlacesIngesterV2:
                 'price_level': price_level_mapped,
                 'opening_hours': opening_hours_jsonb,
                 'primary_photo_ref': primary_photo_ref,  # KISS V1: only photo reference, no URL
+                'district_name': district_name,
+                'neighbourhood_name': neighbourhood_name,
+                'urban_area_mapped_at': datetime.now(timezone.utc).isoformat() if (district_name or neighbourhood_name) else None,
                 'last_ingested_from_google_at': datetime.now(timezone.utc).isoformat()
             }
             
@@ -620,6 +641,9 @@ class GooglePlacesIngesterV2:
                 'primary_photo_ref': primary_photo_ref,
                 'eligibility_status': 'hold',  # V1: always hold
                 'subcategories': subcategories[:5] if subcategories else subcategories,  # Limit subcategories
+                'district_name': district_name,
+                'neighbourhood_name': neighbourhood_name,
+                'urban_area_mapped_at': datetime.now(timezone.utc).isoformat() if (district_name or neighbourhood_name) else None,
                 'last_ingested_from_google_at': datetime.now(timezone.utc).isoformat()
             }
             
