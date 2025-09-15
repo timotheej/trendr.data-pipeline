@@ -470,16 +470,22 @@ class GooglePlacesIngesterV2:
             price_level = result.get('price_level')
             price_level_mapped = self._convert_price_level(price_level) if price_level is not None else None
             
-            # Extract opening hours as jsonb (truncate if too long)
+            # Extract opening hours as jsonb (remove open_now, keep only periods)
             opening_hours = result.get('opening_hours')
             opening_hours_jsonb = None
             if opening_hours:
-                opening_hours_str = json.dumps(opening_hours)
-                # Truncate to 500 chars if needed (database limit)
-                if len(opening_hours_str) > 500:
-                    opening_hours_jsonb = opening_hours_str[:497] + '...'
-                else:
-                    opening_hours_jsonb = opening_hours_str
+                # Remove open_now, keep only periods
+                clean_hours = {}
+                if 'periods' in opening_hours:
+                    clean_hours['periods'] = opening_hours['periods']
+                
+                if clean_hours:  # Only save if we have periods
+                    opening_hours_str = json.dumps(clean_hours)
+                    # Truncate to 500 chars if needed (database limit)
+                    if len(opening_hours_str) > 500:
+                        opening_hours_jsonb = opening_hours_str[:497] + '...'
+                    else:
+                        opening_hours_jsonb = opening_hours_str
             
             # Handle primary photo (KISS V1: only store reference, not URL)
             photos = result.get('photos', [])
@@ -601,21 +607,19 @@ class GooglePlacesIngesterV2:
                 website = details_result.get('website', '')[:500]
                 phone = details_result.get('international_phone_number', '')[:50]
             
-            # Opening hours (details preferred)
+            # Opening hours (details preferred) - keep only periods
             opening_hours_jsonb = None
             opening_hours = source.get('opening_hours')
             if opening_hours and isinstance(opening_hours, dict):
-                # Build minimal but useful opening hours object
-                hours_obj = {
-                    'open_now': opening_hours.get('open_now', False)
-                }
-                # Add weekday_text if available (from details)
-                if 'weekday_text' in opening_hours:
-                    hours_obj['weekday_text'] = opening_hours['weekday_text'][:7]  # Max 7 days
+                # Keep only periods, remove open_now
+                clean_hours = {}
+                if 'periods' in opening_hours:
+                    clean_hours['periods'] = opening_hours['periods']
                 
-                opening_hours_str = json.dumps(hours_obj)
-                if len(opening_hours_str) <= 500:
-                    opening_hours_jsonb = opening_hours_str
+                if clean_hours:  # Only save if we have periods
+                    opening_hours_str = json.dumps(clean_hours)
+                    if len(opening_hours_str) <= 500:
+                        opening_hours_jsonb = opening_hours_str
             
             # Primary photo reference (no URL generation)
             primary_photo_ref = None
@@ -1153,13 +1157,13 @@ class GooglePlacesIngesterV2:
         if price_level is None:
             return None
         
-        # Database enum values - check what values are actually accepted
+        # Map Google price levels to meaningful values
         price_map = {
-            0: None,  # Free -> NULL (safer than 'free' if enum doesn't have it)
-            1: None,  # Inexpensive -> NULL temporarily
-            2: None,  # Moderate -> NULL temporarily 
-            3: None,  # Expensive -> NULL temporarily
-            4: None   # Very expensive -> NULL temporarily
+            0: 'free',
+            1: 'inexpensive', 
+            2: 'moderate',
+            3: 'expensive',
+            4: 'very_expensive'
         }
         return price_map.get(price_level, None)
     
