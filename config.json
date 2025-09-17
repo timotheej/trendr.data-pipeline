@@ -1,12 +1,7 @@
 {
   "pipeline_config": {
     "cities": ["Paris"],
-    "poi_categories": [
-      "restaurant",
-      "bar",
-      "bakery",
-      "cafe"
-    ],
+    "poi_categories": ["restaurant", "bar", "bakery", "cafe"],
     "daily_api_limit": 150,
     "batch_size": 25,
     "max_pois_per_category": 200,
@@ -39,7 +34,7 @@
     "mode": "balanced",
     "match_score": {
       "high": 0.35,
-      "mid": 0.20
+      "mid": 0.2
     },
     "scoring": {
       "name_weight": 0.5,
@@ -179,6 +174,22 @@
       ],
       "global_templates": ["\"{poi_name}\" {category_synonym} {city_name}"],
       "max_templates_per_poi": 25
+    },
+    "trending_discovery": {
+      "enabled": true,
+      "query_templates": [
+        "new restaurant {city} {year}",
+        "recently opened {city}",
+        "hotspot {city} {month} {year}",
+        "trending restaurant {city}",
+        "new opening {city} restaurant",
+        "nouveau restaurant {city}",
+        "tendance restaurant {city}",
+        "ouverture restaurant {city}",
+        "ouverture restaurant {city} {month} {year}"
+      ],
+      "schedule": "weekly",
+      "validation_threshold": 0.6
     }
   },
 

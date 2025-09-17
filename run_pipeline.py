@@ -489,238 +489,100 @@ class GattoPipelineOrchestrator:
             pass  # Ignore parsing errors
     
     def run_ingestion_step(self, city: str) -> bool:
-        """Run H3-based ingestion step (single unified mode)"""
-        # Use config values for H3 ingestion - config-first approach
+        """Run H3-based ingestion step"""
         from config import get_config
         config = get_config()
-        
-        update_interval_days = config.pipeline_config.update_interval_days
-        limit_cells = self.merged_params['batch_size']  # CLI can override batch size
         
         cmd = [
             'python3', 'scripts/google_places_ingester.py',
             '--h3-ingest',
             '--city-slug', city.lower(),
-            '--limit-cells', str(limit_cells),
-            '--update-interval-days', str(update_interval_days)
+            '--limit-cells', str(self.merged_params['batch_size']),
+            '--update-interval-days', str(config.pipeline_config.update_interval_days)
         ]
         
-        if logger.level == logging.DEBUG:
+        if self.merged_params['debug']:
             cmd.append('--debug')
-        
         if self.merged_params['dry_run']:
             cmd.append('--dry-run')
-        
-        # Debug cell option
         if self.merged_params.get('debug_cell'):
             cmd.extend(['--debug-cell', self.merged_params['debug_cell']])
             
-        # Run H3-based ingestion (includes spatial mapping automatically)
-        success = self.run_subprocess(cmd, 'H3-INGEST')
-        
-        return success
+        return self.run_subprocess(cmd, 'H3-INGEST')
     
     def run_mentions_step(self, city: str) -> bool:
-        """Run mentions scanning step"""
-        # Use balanced mode from config, fallback to balanced if not specified
+        """Run mention scanning step"""
         mention_config = self.config.get('mention_scanner', {})
-        scan_mode = mention_config.get('mode', 'balanced')
-        if self.merged_params.get('serp_only'):
-            scan_mode = 'serp-only'
-            
-        cmd = ['python3','-m','scripts.mention_scanner',
-                '--mode', scan_mode,
-                '--city-slug', city.lower()]
+        scan_mode = 'serp-only' if self.merged_params.get('serp_only') else mention_config.get('mode', 'balanced')
         
-        # Add sources ONLY for serp-only mode
-        # balanced mode uses source_catalog automatically, don't override with manual sources
-        if scan_mode == 'serp-only' and (self.config.get('social_proof_config') or {}).get('sources'):
+        cmd = ['python3', '-m', 'scripts.mention_scanner',
+               '--mode', scan_mode, '--city-slug', city.lower()]
+        
+        if scan_mode == 'serp-only' and self.config.get('social_proof_config', {}).get('sources'):
             cmd += ['--sources', ','.join(self.config['social_proof_config']['sources'])]
-            
-        # Debug options - only use supported flags
-        debug_mode = (logger.level == logging.DEBUG) or self.merged_params.get('debug', False)
-        if debug_mode:
+        if self.merged_params['debug']:
             cmd += ['--debug']
             
         return self.run_subprocess(cmd, 'MENTIONS')
     
     def run_classification_step(self, city: str) -> bool:
         """Run classification step"""
-        # Note: intelligent_classifier doesn't support --limit, it processes all POIs for a city
-        cmd = [
-            'python3', 'scripts/intelligent_classifier.py',
-            '--score-city', city.lower()
-        ]
+        cmd = ['python3', 'scripts/intelligent_classifier.py', '--score-city', city.lower()]
         
-        if logger.level == logging.DEBUG or self.merged_params['explain']:
+        if self.merged_params['debug'] or self.merged_params['explain']:
             cmd.append('--debug')
-        
-        # Add force flag for testing to override recent scoring
         if self.merged_params['dry_run'] or self.merged_params['batch_size'] <= 10:
             cmd.append('--force')
             
         return self.run_subprocess(cmd, 'CLASSIFY')
     
-    def run_discovery_grid_step(self, city: str) -> bool:
-        """Run systematic grid discovery of POIs"""
-        cmd = [
-            'python3', 'scripts/google_places_ingester.py',
-            '--grid-scan',
-            '--area', 'all',  # Scan all arrondissements
-            '--grid-step-m', '350',
-            '--radius-m', '400',
-            '--types', 'restaurant,bar,cafe,bakery',
-            '--limit', str(self.merged_params['batch_size'])
-        ]
-        
-        if logger.level == logging.DEBUG:
-            cmd.append('--debug')
-        
-        if self.merged_params['dry_run']:
-            cmd.append('--dry-run')
-            
-        return self.run_subprocess(cmd, 'DISCOVERY-GRID')
-    
-    def run_refresh_stale_step(self, city: str) -> bool:
-        """Refresh stale POIs with updated data"""
-        cmd = [
-            'python3', 'scripts/google_places_ingester.py',
-            '--refresh-stale',
-            '--stale-days', '30',
-            '--limit', str(self.merged_params['batch_size'])
-        ]
-        
-        if logger.level == logging.DEBUG:
-            cmd.append('--debug')
-        
-        if self.merged_params['dry_run']:
-            cmd.append('--dry-run')
-            
-        return self.run_subprocess(cmd, 'REFRESH-STALE')
-    
-    def ingest_single_poi(self, city: str) -> tuple[bool, str]:
-        """Ingest a single POI and return success status and POI name"""
-        cmd = [
-            'python3', 'scripts/google_places_ingester.py',
-            '--seed',
-            '--city-slug', city.lower(),
-            '--limit', '1'
-        ]
-        
-        if logger.level == logging.DEBUG:
-            cmd.append('--debug')
-        
-        if self.merged_params['dry_run']:
-            cmd.append('--dry-run')
-        
-        success, output = self.run_subprocess_with_output(cmd, 'INGEST-SINGLE')
-        
-        if success:
-            # Parse output to get POI name from regular logs
-            poi_name = self._parse_poi_name_from_output(output)
-            
-            # Run spatial association if POI was ingested and not dry-run
-            if poi_name and poi_name != "Unknown POI" and not self.merged_params['dry_run']:
-                try:
-                    from utils.database import SupabaseManager
-                    db = SupabaseManager()
-                    result = db.client.rpc('update_all_paris_pois').execute()
-                    logger.debug(f"✅ Spatial association updated for {poi_name}")
-                except Exception as e:
-                    logger.warning(f"⚠️ Spatial association failed for {poi_name}: {e}")
-            
-            return True, poi_name if poi_name else "Unknown POI"
-        
-        return False, ""
-    
-    def _parse_poi_name_from_output(self, output: str) -> Optional[str]:
-        """Extract POI name from ingester output logs"""
-        import re
-        # Look for pattern "poi_created: <name> | snapshot: written"
-        pattern = r"poi_created: ([^|]+) \|"
-        match = re.search(pattern, output)
-        if match:
-            poi_name = match.group(1).strip()
-            logger.debug(f"Extracted POI name from logs: {poi_name}")
-            return poi_name
-        
-        # Look for pattern "poi_updated: <name> | snapshot: skipped/written"
-        pattern = r"poi_updated: ([^|]+) \|"
-        match = re.search(pattern, output)
-        if match:
-            poi_name = match.group(1).strip()
-            logger.debug(f"Extracted POI name from logs: {poi_name}")
-            return poi_name
-            
-        logger.warning("Could not extract POI name from ingester output")
-        return "Unknown POI"
-    
-    def run_poi_mentions(self, poi_name: str, city: str) -> bool:
-        """Run mention scanning for a specific POI"""
-        mention_config = self.config.get('mention_scanner', {})
-        scan_mode = mention_config.get('mode', 'balanced')
-        if self.merged_params.get('serp_only'):
-            scan_mode = 'serp-only'
-            
+    def run_trending_discovery_step(self, city: str) -> bool:
+        """Run trending discovery step to find new/emerging POIs"""
         cmd = ['python3', '-m', 'scripts.mention_scanner',
-               '--mode', scan_mode,
-               '--city-slug', city.lower(),
-               '--poi-name', poi_name]
+               '--mode', 'trending_discovery', '--city-slug', city.lower()]
         
-        # Add sources for serp-only mode
-        if scan_mode == 'serp-only' and (self.config.get('social_proof_config') or {}).get('sources'):
-            cmd += ['--sources', ','.join(self.config['social_proof_config']['sources'])]
-            
-        # Debug options
-        debug_mode = (logger.level == logging.DEBUG) or self.merged_params.get('debug', False)
-        if debug_mode:
+        if self.merged_params['debug']:
             cmd += ['--debug']
             
-        return self.run_subprocess(cmd, f'MENTIONS-{poi_name[:20]}')
+        return self.run_subprocess(cmd, 'TRENDING-DISCOVERY')
     
-    def run_full_pipeline_poi_by_poi(self, city: str) -> bool:
-        """Run full pipeline POI by POI (ingest → mentions → classify for each POI)"""
-        logger.info(f"🔄 Starting POI-by-POI pipeline for {city} (limit: {self.merged_params['batch_size']})")
+    def run_auto_pipeline(self, city: str) -> bool:
+        """Run complete pipeline: ingest → mentions → classify → trending discovery"""
+        logger.info(f"🚀 Starting AUTO pipeline for {city}")
         
-        processed_pois = 0
-        for i in range(self.merged_params['batch_size']):
-            logger.info(f"📍 Processing POI {i+1}/{self.merged_params['batch_size']}")
-            
-            # Step 1: Ingest single POI
-            success, poi_name = self.ingest_single_poi(city)
-            if not success:
-                logger.warning(f"⚠️ Failed to ingest POI {i+1}, stopping pipeline")
-                break
-                
-            self.stats['ingested'] += 1
-            processed_pois += 1
-            logger.info(f"✅ Ingested: {poi_name}")
-            
-            # Step 2: Scan mentions for this POI
-            if not self.run_poi_mentions(poi_name, city):
-                logger.warning(f"⚠️ Mention scanning failed for {poi_name}")
-                # Continue with next POI even if mentions fail
-            else:
-                logger.info(f"✅ Mentions scanned for: {poi_name}")
-            
-            # Small delay between POIs to be respectful
-            import time
-            time.sleep(0.5)
+        # Step 1: H3 Ingestion
+        logger.info("📍 STEP 1: H3 Ingestion")
+        if not self.run_ingestion_step(city):
+            logger.error("❌ H3 ingestion failed, stopping pipeline")
+            return False
         
-        # Step 3: Run classification for all newly ingested POIs in this city
-        if processed_pois > 0:
-            logger.info(f"🤖 Running classification for {processed_pois} POIs in {city}")
-            if not self.run_classification_step(city):
-                logger.warning(f"⚠️ Classification failed for {city}")
-            
+        # Step 2: Mention Scanning
+        logger.info("🔍 STEP 2: Mention Scanning")
+        if not self.run_mentions_step(city):
+            logger.error("❌ Mention scanning failed, stopping pipeline")
+            return False
         
-        logger.info(f"✅ POI-by-POI pipeline completed for {city}: {processed_pois} POIs processed")
+        # Step 3: Classification
+        logger.info("🤖 STEP 3: Classification")
+        if not self.run_classification_step(city):
+            logger.error("❌ Classification failed, stopping pipeline")
+            return False
+        
+        # Step 4: Trending Discovery (optional, configured via config)
+        trending_config = self.config.get('mention_scanner', {}).get('trending_discovery', {})
+        if trending_config.get('enabled', False):
+            logger.info("🔥 STEP 4: Trending Discovery")
+            if not self.run_trending_discovery_step(city):
+                logger.warning("⚠️ Trending discovery failed, but continuing pipeline")
+        else:
+            logger.info("ℹ️ STEP 4: Trending Discovery (skipped - disabled in config)")
+        
+        logger.info(f"✅ AUTO pipeline completed successfully for {city}")
         return True
+    
     
     def run_pipeline_mode(self) -> bool:
         """Execute pipeline according to selected mode"""
-        success = True
-        
         # Check if this is a seed pipeline execution
         if self.merged_params['seed_poi_name'] or self.merged_params['seed_place_id']:
             logger.info("🌱 SEED → SCAN Pipeline Mode")
@@ -729,38 +591,27 @@ class GattoPipelineOrchestrator:
         for city in self.merged_params['cities']:
             logger.info(f"🏙️  Processing city: {city}")
             
-            if self.merged_params['mode'] in ['full', 'collections']:
-                # Full pipeline: POI-by-POI processing (ingest → mentions for each POI, then classify)
-                if not self.run_full_pipeline_poi_by_poi(city):
-                    success = False
-                    break
-                    
-            elif self.merged_params['mode'] == 'ingest':
+            mode = self.merged_params['mode']
+            if mode == 'auto':
+                if not self.run_auto_pipeline(city):
+                    return False
+            elif mode == 'ingest':
                 if not self.run_ingestion_step(city):
-                    success = False
-                    break
-                    
-            elif self.merged_params['mode'] == 'mentions':
+                    return False
+            elif mode == 'mentions':
                 if not self.run_mentions_step(city):
-                    success = False
-                    break
-                    
-            elif self.merged_params['mode'] == 'classify':
+                    return False
+            elif mode == 'classify':
                 if not self.run_classification_step(city):
-                    success = False
-                    break
-                    
-            elif self.merged_params['mode'] == 'discovery_grid':
-                if not self.run_discovery_grid_step(city):
-                    success = False
-                    break
-                    
-            elif self.merged_params['mode'] == 'refresh_stale':
-                if not self.run_refresh_stale_step(city):
-                    success = False
-                    break
+                    return False
+            elif mode == 'trending':
+                if not self.run_trending_discovery_step(city):
+                    return False
+            else:
+                logger.error(f"Unknown mode: {mode}")
+                return False
         
-        return success
+        return True
     
     def print_final_summary(self):
         """Print final execution summary"""
@@ -795,21 +646,25 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python3 run_pipeline.py --city Paris --mode full --limit 5 --dry-run
-  python3 run_pipeline.py --mode mentions --city Paris --serp-only --cse-num 10  
-  python3 run_pipeline.py --mode classify --city Paris --limit 50 --explain
+  # Complete pipeline (H3 ingestion → mentions → classification)
+  python3 run_pipeline.py --city Paris --mode auto --limit 10
   
-Seed Pipeline (SEED → SCAN):
-  python3 run_pipeline.py --mode mentions --seed-poi-name "Septime" --seed-city Paris
-  python3 run_pipeline.py --mode mentions --seed-place-id "ChIJ..." 
-  python3 run_pipeline.py --mode mentions --seed-poi-name "Frenchie" --seed-city Paris --seed-stdout-json
+  # Individual steps
+  python3 run_pipeline.py --mode ingest --city Paris --limit 20
+  python3 run_pipeline.py --mode mentions --city Paris --debug
+  python3 run_pipeline.py --mode classify --city Paris --explain
+  python3 run_pipeline.py --mode trending --city Paris --debug
+  
+  # Seed Pipeline (SEED → SCAN)
+  python3 run_pipeline.py --seed-poi-name "Septime" --seed-city Paris
+  python3 run_pipeline.py --seed-place-id "ChIJ..." --seed-stdout-json
         """
     )
     
     # Main arguments
     parser.add_argument('--city', help='City to process (if not provided, uses config.json cities)')
-    parser.add_argument('--mode', choices=['full', 'ingest', 'mentions', 'classify', 'collections', 'discovery_grid', 'refresh_stale'],
-                       default='full', help='Pipeline execution mode (collections=alias for full)')
+    parser.add_argument('--mode', choices=['auto', 'ingest', 'mentions', 'classify', 'trending'],
+                       default='auto', help='Pipeline execution mode')
     parser.add_argument('--limit', type=int, help='Batch size for each step (overrides config.json batch_size)')
     parser.add_argument('--dry-run', action='store_true', help='Log actions without network/DB calls')
     

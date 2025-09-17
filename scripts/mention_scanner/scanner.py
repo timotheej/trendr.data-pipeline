@@ -439,6 +439,296 @@ class GattoMentionScanner:
             results['error'] = str(e)
             return results
     
+    def _generate_dynamic_queries(self, trending_config: Dict[str, Any], city_slug: str) -> List[str]:
+        """Generate dynamic queries from templates using current date and city"""
+        from datetime import datetime
+        
+        current_date = datetime.now()
+        year = current_date.year
+        month = current_date.strftime('%B').lower()  # e.g., 'january'
+        
+        # Get city name from profile
+        city_profile = self.city_manager.get_profile(city_slug)
+        city_name = city_profile.city_names_aliases[0].title() if city_profile else city_slug.title()
+        
+        query_templates = trending_config.get('query_templates', [])
+        dynamic_queries = []
+        
+        for template in query_templates:
+            try:
+                query = template.format(
+                    city=city_name,
+                    city_slug=city_slug,
+                    year=year,
+                    month=month
+                )
+                dynamic_queries.append(query)
+            except KeyError as e:
+                logger.warning(f"Missing placeholder in query template '{template}': {e}")
+                continue
+        
+        logger.info(f"Generated {len(dynamic_queries)} dynamic queries for {city_name} ({month} {year})")
+        return dynamic_queries
+    
+    def scan_trending_discovery(self, city_slug: str = 'paris') -> Dict[str, Any]:
+        """
+        Scan trending queries to discover new POIs
+        
+        Args:
+            city_slug: City to search in
+            
+        Returns:
+            Dict with discovery results
+        """
+        # Get trending config and generate dynamic queries
+        trending_config = self.config.get('mention_scanner', {}).get('trending_discovery', {})
+        if not trending_config.get('enabled', False):
+            logger.info("Trending discovery is disabled in config")
+            return {'discovered_poi_names': [], 'total_mentions': 0, 'queries_processed': 0}
+        
+        trending_queries = self._generate_dynamic_queries(trending_config, city_slug)
+        results = {
+            'discovered_poi_names': [], 
+            'total_mentions': 0, 
+            'validation_needed': [],
+            'queries_processed': 0
+        }
+        
+        try:
+            logger.info(f"🔍 Starting trending discovery for {city_slug} with {len(trending_queries)} queries")
+            
+            for query in trending_queries:
+                logger.info(f"🔎 Processing trending query: '{query}'")
+                
+                try:
+                    # Use open CSE search for trending queries
+                    if hasattr(self.collection_router, 'collect_from_cse_open'):
+                        candidates = self.collection_router.collect_from_cse_open(query, city_slug)
+                    else:
+                        # Fallback to CSE searcher directly
+                        candidates = []
+                        if self.cse_searcher:
+                            search_results = self.cse_searcher.search(query, cse_num=10)
+                            candidates = [
+                                {
+                                    'title': result.get('title', ''),
+                                    'snippet': result.get('snippet', ''),
+                                    'url': result.get('link', ''),
+                                    'domain': result.get('domain', '')
+                                }
+                                for result in search_results
+                            ]
+                    
+                    logger.info(f"  📋 Found {len(candidates)} candidates for query: '{query}'")
+                    
+                    # Extract POI names from results
+                    poi_names = self._extract_poi_names_from_mentions(candidates)
+                    
+                    # Log discovery for validation
+                    self._log_trend_discovery(query, poi_names)
+                    
+                    results['discovered_poi_names'].extend(poi_names)
+                    results['total_mentions'] += len(candidates)
+                    results['queries_processed'] += 1
+                    
+                    logger.info(f"  🎯 Extracted {len(poi_names)} potential POI names from query")
+                    
+                except Exception as e:
+                    logger.warning(f"Error processing query '{query}': {e}")
+                    continue
+            
+            # Remove duplicates
+            results['discovered_poi_names'] = list(set(results['discovered_poi_names']))
+            
+            logger.info(f"✅ Trending discovery completed: {len(results['discovered_poi_names'])} unique POI names discovered")
+            
+            # PHASE 3: SYNERGIE - Process discovered POIs for ingestion
+            if results['discovered_poi_names']:
+                validated_pois = self._validate_and_ingest_discovered_pois(results['discovered_poi_names'], city_slug)
+                results['validated_pois'] = validated_pois
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Trending discovery scan failed: {e}")
+            results['error'] = str(e)
+            return results
+    
+    def _extract_poi_names_from_mentions(self, candidates: List[Dict]) -> List[str]:
+        """Extract potential POI names from mention candidates"""
+        poi_names = []
+        
+        # Simple extraction patterns for restaurant/bar names
+        import re
+        
+        for candidate in candidates:
+            title = candidate.get('title', '')
+            snippet = candidate.get('snippet', '')
+            combined_text = f"{title} {snippet}"
+            
+            # Pattern 1: Quoted names (most reliable)
+            quoted_matches = re.findall(r'"([^"]*(?:restaurant|bar|café|cafe|bistrot|brasserie)[^"]*)"', combined_text, re.IGNORECASE)
+            for match in quoted_matches:
+                if len(match.strip()) > 3 and len(match.strip()) < 50:
+                    poi_names.append(match.strip())
+            
+            # Pattern 2: Restaurant/bar names with capitalization
+            restaurant_patterns = [
+                r'Restaurant\s+([A-Z][a-zA-Z\s]+?)(?:\s|,|\.|\|)',
+                r'([A-Z][a-zA-Z\s]+?)\s+Restaurant',
+                r'Bar\s+([A-Z][a-zA-Z\s]+?)(?:\s|,|\.|\|)',
+                r'([A-Z][a-zA-Z\s]+?)\s+Bar',
+                r'Café\s+([A-Z][a-zA-Z\s]+?)(?:\s|,|\.|\|)',
+                r'([A-Z][a-zA-Z\s]+?)\s+Café'
+            ]
+            
+            for pattern in restaurant_patterns:
+                matches = re.findall(pattern, combined_text)
+                for match in matches:
+                    clean_match = match.strip()
+                    if len(clean_match) > 3 and len(clean_match) < 50:
+                        poi_names.append(clean_match)
+        
+        # Clean and deduplicate
+        cleaned_names = []
+        for name in poi_names:
+            # Remove common non-POI words
+            if not any(word in name.lower() for word in ['paris', 'france', 'guide', 'list', 'top', 'best']):
+                cleaned_names.append(name)
+        
+        return list(set(cleaned_names))
+    
+    def _log_trend_discovery(self, query: str, poi_names: List[str]):
+        """Log trend discovery for validation"""
+        try:
+            if hasattr(self, 'db') and self.db:
+                self.db.client.table('trend_discovery_log').insert({
+                    'query_text': query,
+                    'query_type': 'trending_terms',
+                    'poi_names_extracted': poi_names,
+                    'results_count': len(poi_names)
+                }).execute()
+                logger.debug(f"Logged trend discovery: {query} -> {len(poi_names)} POI names")
+        except Exception as e:
+            logger.warning(f"Failed to log trend discovery: {e}")
+    
+    def _validate_and_ingest_discovered_pois(self, poi_names: List[str], city_slug: str) -> List[Dict[str, Any]]:
+        """
+        PHASE 3: SYNERGIE - Validate discovered POI names and trigger ingestion
+        
+        This creates the crucial feedback loop:
+        Discovery → Validation → Ingestion (with high novelty) → Future mention scanning
+        """
+        validated_pois = []
+        
+        logger.info(f"🔗 SYNERGIE: Starting validation and ingestion for {len(poi_names)} discovered POIs")
+        
+        for poi_name in poi_names:
+            try:
+                # Step 1: Check if POI already exists in database
+                existing_poi = self._check_poi_exists(poi_name, city_slug)
+                if existing_poi:
+                    logger.info(f"  ↩️ SKIP: '{poi_name}' already exists in DB (id: {existing_poi.get('id', 'unknown')})")
+                    continue
+                
+                # Step 2: Call Google Places ingester for this specific POI
+                ingestion_result = self._trigger_poi_ingestion(poi_name, city_slug)
+                
+                if ingestion_result.get('success'):
+                    poi_data = ingestion_result.get('poi_data', {})
+                    validated_pois.append({
+                        'discovered_name': poi_name,
+                        'ingested_poi': poi_data,
+                        'status': 'ingested_with_high_novelty'
+                    })
+                    logger.info(f"  ✅ INGESTED: '{poi_name}' → POI ID: {poi_data.get('id', 'unknown')}")
+                else:
+                    logger.warning(f"  ❌ FAILED: Could not ingest '{poi_name}': {ingestion_result.get('error', 'unknown')}")
+                    validated_pois.append({
+                        'discovered_name': poi_name,
+                        'status': 'validation_failed',
+                        'error': ingestion_result.get('error')
+                    })
+            
+            except Exception as e:
+                logger.error(f"Error processing discovered POI '{poi_name}': {e}")
+                validated_pois.append({
+                    'discovered_name': poi_name,
+                    'status': 'processing_error',
+                    'error': str(e)
+                })
+        
+        logger.info(f"🎯 SYNERGIE RESULT: {len([p for p in validated_pois if p['status'] == 'ingested_with_high_novelty'])} POIs successfully ingested")
+        return validated_pois
+    
+    def _check_poi_exists(self, poi_name: str, city_slug: str) -> Optional[Dict[str, Any]]:
+        """Check if POI already exists in database"""
+        try:
+            if hasattr(self, 'db') and self.db:
+                # Use fuzzy search to account for slight name variations
+                result = self.db.client.table('poi').select('id,name').ilike('name', f'%{poi_name}%').eq('city_slug', city_slug).limit(1).execute()
+                if result.data:
+                    return result.data[0]
+        except Exception as e:
+            logger.debug(f"Error checking POI existence: {e}")
+        return None
+    
+    def _trigger_poi_ingestion(self, poi_name: str, city_slug: str) -> Dict[str, Any]:
+        """
+        Trigger Google Places ingestion for discovered POI with high novelty scoring
+        
+        This is the KEY SYNERGIE: discovered POIs get ingested with novelty boost
+        """
+        try:
+            import subprocess
+            import json
+            
+            # Call the ingester with special flags for trending discovery
+            cmd = [
+                'python3', 'scripts/google_places_ingester.py',
+                '--poi-name', poi_name,
+                '--city', city_slug,
+                '--trending-discovery',  # Special flag to mark as trending discovery
+                '--stdout-json'
+            ]
+            
+            # Only add --commit if not in dry run mode
+            if hasattr(self, 'db') and not getattr(self.db, 'dry_run', False):
+                cmd.append('--commit')
+            
+            logger.debug(f"Triggering ingestion: {' '.join(cmd)}")
+            
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            if result.returncode == 0:
+                # Parse JSON output to get POI data
+                for line in result.stdout.strip().split('\n'):
+                    if line.strip().startswith('{'):
+                        try:
+                            data = json.loads(line)
+                            if data.get('status') == 'upserted':
+                                poi_data = data.get('poi', {})
+                                return {
+                                    'success': True,
+                                    'poi_data': poi_data
+                                }
+                        except json.JSONDecodeError:
+                            continue
+                            
+                return {'success': False, 'error': 'No valid JSON output from ingester'}
+            else:
+                return {'success': False, 'error': f"Ingester failed: {result.stderr}"}
+                
+        except subprocess.TimeoutExpired:
+            return {'success': False, 'error': 'Ingestion timeout'}
+        except Exception as e:
+            return {'success': False, 'error': f"Ingestion error: {str(e)}"}
+    
     def _process_candidates_kiss(self, poi: Dict[str, Any], candidates: List[Dict[str, Any]], 
                                 limit_per_poi: int = None) -> Dict[str, Any]:
         """KISS candidate processing pipeline: normalize, dedup, score, decide, log"""
@@ -1003,8 +1293,8 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='GATTO Mention Scanner - KISS Edition (3 modes: balanced/serp-only/open)')
-    parser.add_argument('--mode', choices=['balanced', 'open', 'serp-only'], default='balanced', 
-                        help='Mode: balanced=catalog+CSE, open=CSE only, serp-only=specified sources only')
+    parser.add_argument('--mode', choices=['balanced', 'open', 'serp-only', 'trending_discovery'], default='balanced', 
+                        help='Mode: balanced=catalog+CSE, open=CSE only, serp-only=specified sources only, trending_discovery=trend queries')
     parser.add_argument('--poi-name', help='Single POI name (e.g. "Le Rigmarole")')
     parser.add_argument('--poi-names', help='Multiple POI names (e.g. "Septime,Le Chateaubriand")')
     parser.add_argument('--sources', help='Source list for serp-only mode (e.g. "lefooding.com,timeout.fr")')
@@ -1047,7 +1337,7 @@ def main():
         elif args.poi_names:
             poi_names = [name.strip() for name in args.poi_names.split(',')]
         
-        if not poi_names:
+        if not poi_names and args.mode != 'trending_discovery':
             logger.error(f"{args.mode.title()} mode requires --poi-name or --poi-names")
             return 1
         
@@ -1079,6 +1369,12 @@ def main():
                 city_slug=args.city_slug,
                 limit_per_poi=args.limit_per_poi,
                 category=args.category
+            )
+            
+        elif args.mode == 'trending_discovery':
+            # Trending discovery mode - now with dynamic queries
+            results = scanner.scan_trending_discovery(
+                city_slug=args.city_slug
             )
             
         else:  # balanced mode (default)

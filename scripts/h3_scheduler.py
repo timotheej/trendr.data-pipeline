@@ -12,8 +12,7 @@ except ImportError:
     import sys
     import os
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    import h3_mock as h3
-    print("⚠️ Using H3 mock - install h3 library for production use")
+    raise ImportError("H3 library required - install with: pip install h3")
 import json
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timedelta, timezone
@@ -74,6 +73,9 @@ class H3Scheduler:
         
         # Use config-driven saturation threshold
         self.saturation_threshold = self.config.h3.scan_cap_per_cell
+        
+        # Initialize novelty detection
+        self.novelty_detector = H3SchedulerNovelty(db)
     
     def seed_h3_cells_if_needed(self, city_slug: str, res_base: Optional[int] = None) -> int:
         """
@@ -234,7 +236,7 @@ class H3Scheduler:
             poi_ids_touched = []
             total_results = 0
             api_requests_made = 0
-            saturated = False
+            category_counts = []
             
             logger.info(f"Scanning H3 cell {h3_id} (res={res}) at ({lat:.6f}, {lng:.6f}) radius={radius_m}m")
             
@@ -242,9 +244,6 @@ class H3Scheduler:
             for category in categories:
                 logger.debug(f"Scanning category '{category}' in cell {h3_id}")
                 
-                # Use nearby search with center and radius
-                # This is a placeholder - the actual implementation will depend on
-                # integrating with the existing GooglePlacesIngester
                 category_results = self._scan_category_in_cell(
                     lat, lng, radius_m, category, ingester, city_slug, h3_id
                 )
@@ -252,11 +251,20 @@ class H3Scheduler:
                 poi_ids_touched.extend(category_results['poi_ids'])
                 total_results += category_results['count']
                 api_requests_made += category_results['api_requests']
-                
-                # Check for saturation
-                if category_results['count'] >= self.saturation_threshold:
-                    saturated = True
-                    logger.warning(f"Cell {h3_id} saturated with category '{category}': {category_results['count']} results")
+                category_counts.append(category_results['count'])
+            
+            # Saturation logic: Total ≥ threshold OR any category hit API limit (20)
+            max_category_count = max(category_counts) if category_counts else 0
+            api_limit_per_category = 20
+            
+            saturated = (total_results >= self.saturation_threshold or 
+                        max_category_count >= api_limit_per_category)
+            
+            if saturated:
+                if max_category_count >= api_limit_per_category:
+                    logger.warning(f"Cell {h3_id} saturated: category hit API limit ({max_category_count}/{api_limit_per_category})")
+                if total_results >= self.saturation_threshold:
+                    logger.warning(f"Cell {h3_id} saturated: total results ({total_results}/{self.saturation_threshold})")
             
             return ScanResult(
                 poi_ids_touched=poi_ids_touched,
@@ -289,15 +297,35 @@ class H3Scheduler:
             
             # Process each place found
             for place in places:
-                # Check if place passes quality gate
+                # Get place data
                 rating = place.get('rating')
-                reviews_count = place.get('user_ratings_total')
+                reviews_count = place.get('userRatingCount')
+                place_name = place.get('displayName', {}).get('text', 'Unknown') if place.get('displayName') else 'Unknown'
                 
-                if not ingester.pass_quality_gate(rating, reviews_count):
+                logger.info(f"Processing place: {place_name}, rating: {rating}, reviews: {reviews_count}")
+                
+                # Calculate novelty score
+                novelty_score = self.novelty_detector.calculate_novelty_score(place, rating, reviews_count)
+                novelty_classification = self.novelty_detector.classify_novelty(novelty_score)
+                
+                logger.info(f"Novelty: {place_name} -> score={novelty_score:.2f}, class={novelty_classification}")
+                
+                # New logic: process if novelty score >= 0.4 OR passes quality gate
+                should_get_details = (
+                    novelty_score >= 0.4 or  # POIs potentially new
+                    ingester.pass_quality_gate(rating, reviews_count)  # POIs that pass quality gate
+                )
+                
+                if not should_get_details:
+                    logger.info(f"Place {place_name} skipped (novelty_score: {novelty_score:.2f})")
                     continue
                 
+                # Store novelty data for upsert
+                place['_novelty_score'] = novelty_score
+                place['_novelty_classification'] = novelty_classification
+                
                 # TOUJOURS récupérer les détails pour avoir toutes les données
-                details = ingester.get_place_details(place.get('place_id'))
+                details = ingester.get_place_details(place.get('id'))
                 if details:
                     api_requests += 1
                     # Combiner les données de base et les détails
@@ -327,7 +355,7 @@ class H3Scheduler:
                                 logger.warning(f"Urban area mapping failed for POI {poi_id}: {e}")
                             
                             # Create rating snapshot si on a les détails
-                            if details and details.get('rating') and details.get('user_ratings_total'):
+                            if details and details.get('rating') and details.get('userRatingCount'):
                                 ingester.create_rating_snapshot(poi_id, details)
                                         
                     except Exception as e:
@@ -586,6 +614,68 @@ def get_paris_polygon(db: SupabaseManager) -> Polygon:
     except Exception as e:
         logger.error(f"Error creating Paris polygon: {e}")
         raise
+
+
+class H3SchedulerNovelty:
+    """Novelty detection methods for H3Scheduler"""
+    
+    def __init__(self, db: SupabaseManager):
+        self.db = db
+    
+    def calculate_novelty_score(self, place: Dict, rating: Optional[float], reviews_count: Optional[int]) -> float:
+        """Calculate novelty score for a POI"""
+        score = 0.0
+        
+        # Factor 1: Reviews Pattern (40% weight)
+        if rating is None and reviews_count is None:
+            score += 0.4  # No reviews = very likely new
+        elif reviews_count is not None and reviews_count < 5:
+            score += 0.35  # Very few reviews = likely recent
+        elif reviews_count is not None and reviews_count < 20 and rating and rating > 4.5:
+            score += 0.25  # Few reviews but excellent = promising new
+        
+        # Factor 2: Historical Absence (30% weight)
+        place_id = place.get('id')
+        if place_id and not self._exists_in_db(place_id):
+            score += 0.3  # Never seen = new
+        
+        # Factor 3: Name Patterns (15% weight)
+        name = place.get('displayName', {}).get('text', '') if place.get('displayName') else ''
+        name_signals = ["new", "nouveau", "fresh", "recent", "opening", "2025"]
+        if any(signal in name.lower() for signal in name_signals):
+            score += 0.15
+        
+        # Factor 4: Business Type (10% weight)
+        types = place.get('types', [])
+        dynamic_types = ["restaurant", "bar", "cafe", "bakery"]
+        if any(t in dynamic_types for t in types):
+            score += 0.1
+        
+        # Factor 5: Address Patterns (5% weight)
+        address = place.get('formattedAddress', '')
+        if any(signal in address.lower() for signal in ["new", "recent", "opening"]):
+            score += 0.05
+        
+        return min(score, 1.0)
+
+    def classify_novelty(self, score: float) -> str:
+        """Classify novelty based on score"""
+        if score >= 0.8:
+            return "highly_likely_new"
+        elif score >= 0.6:
+            return "likely_new" 
+        elif score >= 0.4:
+            return "potentially_new"
+        else:
+            return "established"
+
+    def _exists_in_db(self, google_place_id: str) -> bool:
+        """Check if POI already exists in database"""
+        try:
+            result = self.db.client.table('poi').select('id').eq('google_place_id', google_place_id).execute()
+            return bool(result.data)
+        except:
+            return False
 
 
 # CLI for testing H3 scheduler functionality

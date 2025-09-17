@@ -21,20 +21,15 @@ logger = logging.getLogger(__name__)
 class GooglePlacesIngester:
     """KISS H3-based Google Places ingester - config-driven, no hardcoded values"""
     
-    def __init__(self, dry_run: bool = False, mock_mode: bool = False):
+    def __init__(self, dry_run: bool = False):
         self.dry_run = dry_run
-        self.mock_mode = mock_mode
         self.config = get_config()
         
-        if not mock_mode:
-            self.db = SupabaseManager()
-            if not self.config.google_places_api_key:
-                logger.error("Missing GOOGLE_PLACES_API_KEY")
-                sys.exit(1)
-            self.api_key = self.config.google_places_api_key
-        else:
-            self.db = None
-            self.api_key = 'mock-key'
+        self.db = SupabaseManager()
+        if not self.config.google_places_api_key:
+            logger.error("Missing GOOGLE_PLACES_API_KEY")
+            sys.exit(1)
+        self.api_key = self.config.google_places_api_key
         
         # Use config-driven token limits
         self.daily_tokens = self.config.pipeline_config.daily_api_limit
@@ -118,72 +113,185 @@ class GooglePlacesIngester:
         }
     
     def get_place_details(self, place_id: str) -> Optional[Dict[str, Any]]:
-        """Get place details"""
-        if self.mock_mode:
-            return {
-                'place_id': place_id,
-                'rating': 4.2,
-                'user_ratings_total': 100
-            }
-        
+        """Get place details using Places (New) API"""
         if not self._consume_token('basic'):
             return None
         
         try:
-            url = "https://maps.googleapis.com/maps/api/place/details/json"
-            params = {
-                'place_id': place_id,
-                'fields': 'formatted_address,formatted_phone_number,international_phone_number,website,opening_hours,photos,rating,user_ratings_total,price_level',
-                'key': self.api_key
+            url = f"https://places.googleapis.com/v1/places/{place_id}"
+            headers = {
+                'X-Goog-Api-Key': self.api_key,
+                'X-Goog-FieldMask': 'formattedAddress,internationalPhoneNumber,websiteUri,currentOpeningHours,rating,userRatingCount,priceLevel,photos',
+                'Accept-Language': 'en'
             }
             
-            response = requests.get(url, params=params)
+            response = requests.get(url, headers=headers)
             response.raise_for_status()
             data = response.json()
             
-            if data.get('status') == 'OK':
-                return data.get('result')
-            return None
+            # Convert new API format to legacy format for compatibility
+            converted_data = {
+                'place_id': place_id,
+                'formatted_address': data.get('formattedAddress'),
+                'rating': data.get('rating'),
+                'user_ratings_total': data.get('userRatingCount'),
+                'price_level': data.get('priceLevel'),
+                'website': data.get('websiteUri'),
+                'international_phone_number': data.get('internationalPhoneNumber'),
+                'formatted_phone_number': data.get('internationalPhoneNumber'),  # Use same field for both
+            }
+            
+            # Convert opening hours format
+            current_hours = data.get('currentOpeningHours')
+            if current_hours and current_hours.get('periods'):
+                converted_data['opening_hours'] = {
+                    'periods': current_hours['periods']
+                }
+            
+            # Convert photos format
+            if data.get('photos'):
+                converted_data['photos'] = [
+                    {'photo_reference': photo.get('name')} 
+                    for photo in data.get('photos', [])
+                ]
+            
+            return converted_data
                 
         except Exception as e:
-            logger.error(f"Place details API error: {e}")
+            logger.error(f"Place details (New) API error: {e}")
             return None
     
     def search_places_nearby(self, location: str, radius: int, place_type: str) -> List[Dict[str, Any]]:
-        """Search places using Google Places Nearby Search API"""
-        if self.mock_mode:
-            return [
-                {
-                    'place_id': f'mock-{place_type}-{i}',
-                    'name': f'Mock {place_type.title()} {i}',
-                    'geometry': {'location': {'lat': 48.8566 + i*0.0005, 'lng': 2.3522 + i*0.0005}},
-                    'types': [place_type],
-                    'rating': 4.0 + i*0.1,
-                    'user_ratings_total': 50 + i*10,
-                    'formatted_address': f'Address {i}, Paris, France'
-                } for i in range(1, 10)
-            ]
-        
+        """Search places using Google Places Nearby Search (New) API"""
         if not self._consume_token('basic'):
             return []
         
         try:
-            url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
-            params = {
-                'location': location,
-                'radius': radius,
-                'type': place_type,
-                'key': self.api_key
+            # Parse lat,lng from location string
+            lat, lng = location.split(',')
+            lat, lng = float(lat.strip()), float(lng.strip())
+            
+            url = "https://places.googleapis.com/v1/places:searchNearby"
+            headers = {
+                'Content-Type': 'application/json',
+                'X-Goog-Api-Key': self.api_key,
+                'X-Goog-FieldMask': 'places.id,places.displayName,places.location,places.types,places.formattedAddress,places.photos,places.rating,places.userRatingCount',
+                'Accept-Language': 'en'
             }
             
-            response = requests.get(url, params=params)
+            # Request body for Nearby Search (New)
+            body = {
+                'includedTypes': [place_type],
+                'maxResultCount': 20,
+                'locationRestriction': {
+                    'circle': {
+                        'center': {
+                            'latitude': lat,
+                            'longitude': lng
+                        },
+                        'radius': float(radius)
+                    }
+                }
+            }
+            
+            response = requests.post(url, headers=headers, json=body)
             response.raise_for_status()
             data = response.json()
             
-            return data.get('results', [])
+            # Convert new API format to legacy format for compatibility
+            places = data.get('places', [])
+            converted_places = []
+            
+            for place in places:
+                converted_place = {
+                    'id': place.get('id'),  # Keep new API format
+                    'place_id': place.get('id'),  # Legacy compatibility
+                    'name': place.get('displayName', {}).get('text'),
+                    'displayName': place.get('displayName'),  # Keep new API format
+                    'rating': place.get('rating'),
+                    'userRatingCount': place.get('userRatingCount'),
+                    'geometry': {
+                        'location': {
+                            'lat': place.get('location', {}).get('latitude'),
+                            'lng': place.get('location', {}).get('longitude')
+                        }
+                    },
+                    'types': place.get('types', []),
+                    'formatted_address': place.get('formattedAddress'),
+                    'photos': []
+                }
+                
+                # Convert photos format
+                if place.get('photos'):
+                    converted_place['photos'] = [
+                        {'photo_reference': photo.get('name')} 
+                        for photo in place.get('photos', [])
+                    ]
+                
+                converted_places.append(converted_place)
+            
+            return converted_places
             
         except Exception as e:
-            logger.error(f"Nearby search failed for '{place_type}' at {location}: {e}")
+            logger.error(f"Nearby search (New) failed for '{place_type}' at {location}: {e}")
+            return []
+    
+    def search_places_by_name(self, poi_name: str, city: str) -> List[Dict[str, Any]]:
+        """
+        Search places by name using Google Places Text Search (New) API
+        Used for trending discovery POI validation
+        """
+        if not self._consume_token('basic'):
+            return []
+        
+        try:
+            url = "https://places.googleapis.com/v1/places:searchText"
+            headers = {
+                'Content-Type': 'application/json',
+                'X-Goog-Api-Key': self.api_key,
+                'X-Goog-FieldMask': 'places.id,places.displayName,places.location,places.types,places.formattedAddress,places.rating,places.userRatingCount',
+                'Accept-Language': 'en'
+            }
+            
+            # Text search query
+            query = f"{poi_name} {city}"
+            body = {
+                'textQuery': query,
+                'maxResultCount': 5,  # Just need first few results
+                'includedType': 'restaurant'  # Can be adjusted based on discovery context
+            }
+            
+            response = requests.post(url, headers=headers, json=body)
+            response.raise_for_status()
+            data = response.json()
+            
+            # Convert new API format to legacy format for compatibility
+            places = data.get('places', [])
+            converted_places = []
+            
+            for place in places:
+                converted_place = {
+                    'id': place.get('id'),
+                    'place_id': place.get('id'),
+                    'name': place.get('displayName', {}).get('text'),
+                    'rating': place.get('rating'),
+                    'user_ratings_total': place.get('userRatingCount'),
+                    'geometry': {
+                        'location': {
+                            'lat': place.get('location', {}).get('latitude'),
+                            'lng': place.get('location', {}).get('longitude')
+                        }
+                    },
+                    'types': place.get('types', []),
+                    'formatted_address': place.get('formattedAddress')
+                }
+                converted_places.append(converted_place)
+            
+            logger.debug(f"Text search '{query}' returned {len(converted_places)} results")
+            return converted_places
+            
+        except Exception as e:
+            logger.error(f"Text search failed for '{poi_name}' in {city}: {e}")
             return []
     
     def extract_country_from_address(self, formatted_address: str) -> Optional[str]:
@@ -341,13 +449,18 @@ class GooglePlacesIngester:
             if not google_place_id:
                 return None
             
-            # Extract rating data for snapshot and eligibility
+            # Extract rating and novelty data
             rating = row.pop('_rating', None)
             user_ratings_total = row.pop('_user_ratings_total', None)
+            novelty_score = row.pop('_novelty_score', None)
+            novelty_classification = row.pop('_novelty_classification', None)
             
-            # Determine eligibility status based on quality thresholds
-            # The key requirement: rating thresholds don't block POI insertion, only affect eligibility
-            if rating is not None and user_ratings_total is not None:
+            # Determine eligibility status with novelty awareness
+            if novelty_score and novelty_score >= 0.8:
+                row['eligibility_status'] = 'emerging_priority'
+            elif novelty_score and novelty_score >= 0.6:
+                row['eligibility_status'] = 'emerging_potential'
+            elif rating is not None and user_ratings_total is not None:
                 if rating >= self.rating_min and user_ratings_total >= self.min_reviews:
                     row['eligibility_status'] = 'eligible'
                 else:
@@ -355,6 +468,12 @@ class GooglePlacesIngester:
             else:
                 # No rating data available - mark as hold until we get rating info
                 row['eligibility_status'] = 'hold'
+            
+            # Add novelty fields
+            if novelty_score is not None:
+                row['novelty_score'] = novelty_score
+            if novelty_classification:
+                row['novelty_classification'] = novelty_classification
             
             # Add urban area mapping timestamp at insertion time
             row['urban_area_mapped_at'] = datetime.now(timezone.utc).isoformat()
@@ -374,7 +493,9 @@ class GooglePlacesIngester:
                 self.db.client.table('poi').update(update_data).eq('id', poi_id).execute()
                 logger.debug(f"poi_updated: {row.get('name')} (id: {poi_id})")
             else:
-                # Insert new POI - ALWAYS successful regardless of rating
+                # Insert new POI - Set first_ingested_at for new POIs
+                row['first_ingested_at'] = datetime.now(timezone.utc).isoformat()
+                
                 insert_result = self.db.client.table('poi').insert(row).execute()
                 if insert_result.data:
                     poi_id = insert_result.data[0]['id']
@@ -433,6 +554,139 @@ class GooglePlacesIngester:
             logger.error(f"Error writing rating snapshot: {e}")
             return False
 
+    def run_individual_poi_ingestion(self, poi_name: str = None, place_id: str = None, 
+                                    city: str = 'paris', trending_discovery: bool = False,
+                                    commit: bool = False, stdout_json: bool = False) -> Dict[str, Any]:
+        """
+        PHASE 3 SYNERGIE: Ingest individual POI by name or place_id with trending discovery support
+        
+        This method supports the trending discovery feedback loop:
+        - POI discovered via trending search → ingested with high novelty score
+        """
+        import json
+        from datetime import datetime, timezone
+        
+        logger.info(f"🎯 Individual POI Ingestion: {poi_name or place_id} (trending: {trending_discovery})")
+        
+        result = {
+            'status': 'error',
+            'poi': None,
+            'error': None,
+            'trending_discovery': trending_discovery
+        }
+        
+        try:
+            if place_id:
+                # Direct place details by ID
+                place_data = self.get_place_details(place_id)
+                if not place_data:
+                    error_msg = f"Place ID {place_id} not found"
+                    result['error'] = error_msg
+                    if stdout_json:
+                        print(json.dumps(result))
+                    return result
+            elif poi_name:
+                # Search by name in city  
+                search_results = self.search_places_by_name(poi_name, city)
+                if not search_results:
+                    error_msg = f"POI '{poi_name}' not found in {city}"
+                    result['error'] = error_msg
+                    if stdout_json:
+                        print(json.dumps(result))
+                    return result
+                
+                # Take first result - use search result data directly since it has the name
+                place_data = search_results[0]
+                place_id = place_data.get('place_id')
+                
+                # Get additional details if needed, but keep search result name
+                details = self.get_place_details(place_id)
+                if details:
+                    place_data.update(details)  # Merge details but keep search result name
+                
+            else:
+                error_msg = "Either poi_name or place_id must be provided"
+                result['error'] = error_msg
+                if stdout_json:
+                    print(json.dumps(result))
+                return result
+            
+            # Calculate novelty score with trending discovery boost
+            novelty_score = None
+            if trending_discovery:
+                # High novelty score for trending discoveries
+                from scripts.h3_scheduler import H3SchedulerNovelty
+                novelty_detector = H3SchedulerNovelty(self.db)
+                
+                # Base novelty + trending boost
+                base_novelty = novelty_detector.calculate_novelty_score(
+                    place_data, 
+                    place_data.get('rating', 0), 
+                    place_data.get('user_ratings_total', 0)
+                )
+                # Trending discovery gets +0.3 boost (minimum 0.8)
+                novelty_score = max(0.8, base_novelty + 0.3)
+                logger.info(f"  🔥 TRENDING BOOST: novelty {base_novelty:.2f} → {novelty_score:.2f}")
+            
+            # Upsert POI with novelty data
+            if commit and not self.dry_run:
+                # Convert to poi row format and add novelty data
+                poi_row_data = self.to_poi_row(place_data, city.lower())
+                
+                if not poi_row_data:
+                    # For trending discoveries, bypass quality checks and create minimal row
+                    poi_row_data = {
+                        'google_place_id': place_data.get('place_id'),
+                        'name': place_data.get('name'),
+                        'city_slug': city.lower(),
+                        'lat': place_data.get('geometry', {}).get('location', {}).get('lat'),
+                        'lng': place_data.get('geometry', {}).get('location', {}).get('lng'),
+                        'address_street': place_data.get('formatted_address'),
+                        'city': city.title(),
+                        'country': 'France',  # Default for Paris
+                        'eligibility_status': 'emerging_priority'  # Bypass quality gates
+                    }
+                    logger.info(f"  🔄 TRENDING BYPASS: Created minimal row for low-quality POI")
+                
+                if poi_row_data and novelty_score is not None:
+                    poi_row_data['novelty_score'] = novelty_score
+                    poi_row_data['novelty_classification'] = novelty_detector.classify_novelty(novelty_score)
+                    poi_row_data['first_ingested_at'] = datetime.now(timezone.utc).isoformat()
+                    # Set high priority eligibility for trending discoveries
+                    if novelty_score >= 0.8:
+                        poi_row_data['eligibility_status'] = 'emerging_priority'
+                
+                poi_id = self.upsert_poi(poi_row_data) if poi_row_data else None
+                if poi_id:
+                    result['status'] = 'upserted'
+                    result['poi'] = poi_row_data.copy()
+                    result['poi']['id'] = poi_id
+                    logger.info(f"  ✅ UPSERTED: {poi_row_data.get('name')} (ID: {poi_id})")
+                else:
+                    result['error'] = 'Upsert failed'
+            else:
+                # Dry run - just return preview
+                result['status'] = 'dry_run' 
+                result['poi_preview'] = {
+                    'name': place_data.get('name'),
+                    'place_id': place_data.get('place_id'),
+                    'city': city.lower(),
+                    'novelty_score': novelty_score
+                }
+                logger.info(f"  📝 DRY RUN: {place_data.get('name')} (novelty: {novelty_score})")
+            
+            if stdout_json:
+                print(json.dumps(result))
+            
+            return result
+            
+        except Exception as e:
+            error_msg = f"Individual POI ingestion failed: {str(e)}"
+            logger.error(error_msg)
+            result['error'] = error_msg
+            if stdout_json:
+                print(json.dumps(result))
+            return result
 
     def run_h3_ingestion(self, city_slug: str = 'paris', limit_cells: int = 300, 
                         update_interval_days: int = 7, debug_cell: str = None) -> Dict[str, Any]:
@@ -535,11 +789,22 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='Google Places Ingester - Minimal H3 Version')
+    # H3 mode arguments
     parser.add_argument('--h3-ingest', action='store_true', help='Run H3-based ingestion')
     parser.add_argument('--limit-cells', type=int, default=300, help='Max H3 cells to process')
     parser.add_argument('--update-interval-days', type=int, default=7, help='TTL for cell rescanning')
     parser.add_argument('--debug-cell', type=str, help='Debug: scan specific H3 cell')
-    parser.add_argument('--city-slug', default='paris', help='City slug')
+    
+    # Individual POI mode arguments
+    parser.add_argument('--poi-name', help='Ingest specific POI by name')
+    parser.add_argument('--place-id', help='Ingest specific POI by Google Place ID')
+    parser.add_argument('--city', default='paris', help='City for POI search')
+    parser.add_argument('--trending-discovery', action='store_true', help='Mark as trending discovery (high novelty boost)')
+    parser.add_argument('--commit', action='store_true', help='Commit changes to database')
+    parser.add_argument('--stdout-json', action='store_true', help='Output JSON to stdout')
+    
+    # Common arguments
+    parser.add_argument('--city-slug', default='paris', help='City slug (for H3 mode)')
     parser.add_argument('--dry-run', action='store_true', help='Dry run mode')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     
@@ -550,9 +815,20 @@ def main():
     logging.basicConfig(level=log_level, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     
     try:
-        ingester = GooglePlacesIngester(dry_run=args.dry_run, mock_mode=False)
+        ingester = GooglePlacesIngester(dry_run=args.dry_run)
         
-        if args.h3_ingest:
+        if args.poi_name or args.place_id:
+            # Individual POI ingestion mode
+            result = ingester.run_individual_poi_ingestion(
+                poi_name=args.poi_name,
+                place_id=args.place_id,
+                city=args.city,
+                trending_discovery=args.trending_discovery,
+                commit=args.commit,
+                stdout_json=args.stdout_json
+            )
+        elif args.h3_ingest:
+            # H3 ingestion mode
             result = ingester.run_h3_ingestion(
                 city_slug=args.city_slug,
                 limit_cells=args.limit_cells,
@@ -560,17 +836,19 @@ def main():
                 debug_cell=args.debug_cell
             )
         else:
+            # Default to H3 mode
             result = ingester.run_h3_ingestion(city_slug=args.city_slug)
         
-        # Print results
-        mode = "DRY RUN" if args.dry_run else "LIVE"
-        print(f"\n🎯 H3 Results ({mode}):")
-        print(f"   Cells scanned: {result['cells_scanned']}")
-        print(f"   Cells split: {result['cells_split']}")
-        print(f"   Ingested: {result['total_ingested']} POIs")
-        print(f"   Skipped: {result['total_skipped']} POIs")
-        print(f"💰 Cost: ${result['cost_estimate']['estimate_usd']}")
-        print(f"🪣 Tokens: {result['cost_estimate']['tokens_remaining']}")
+        # Print results (only for H3 mode)
+        if args.h3_ingest or (not args.poi_name and not args.place_id):
+            mode = "DRY RUN" if args.dry_run else "LIVE"
+            print(f"\n🎯 H3 Results ({mode}):")
+            print(f"   Cells scanned: {result['cells_scanned']}")
+            print(f"   Cells split: {result['cells_split']}")
+            print(f"   Ingested: {result['total_ingested']} POIs")
+            print(f"   Skipped: {result['total_skipped']} POIs")
+            print(f"💰 Cost: ${result['cost_estimate']['estimate_usd']}")
+            print(f"🪣 Tokens: {result['cost_estimate']['tokens_remaining']}")
         
         sys.exit(0)
         
