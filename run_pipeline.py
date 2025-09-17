@@ -20,8 +20,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class TrendrPipelineOrchestrator:
-    """Main orchestrator for Trendr data pipeline - Gatto version"""
+class GattoPipelineOrchestrator:
+    """Main orchestrator for Gatto data pipeline"""
     
     def __init__(self):
         self.start_time = datetime.now()
@@ -29,7 +29,9 @@ class TrendrPipelineOrchestrator:
             'ingested': 0,
             'mentions_processed': 0, 
             'classified': 0,
-            'photos_processed': 0,
+            'mapped_districts': 0,
+            'mapped_neighbourhoods': 0,
+            'rating_snapshots': 0,
             'errors': []
         }
         self.config = {}
@@ -77,6 +79,7 @@ class TrendrPipelineOrchestrator:
         # cse_num is now handled by config_resolver (CLI > ENV > config > defaults)
         merged['explain'] = args.explain
         merged['debug'] = args.debug
+        merged['debug_cell'] = args.debug_cell
         
         # sources optionnelles depuis config (neutre si absent)
         merged['sources'] = (self.config.get('social_proof_config', {}) or {}).get('sources')
@@ -90,7 +93,6 @@ class TrendrPipelineOrchestrator:
         
         # Config values
         merged['poi_categories'] = pipeline_config.get('poi_categories', [])
-        merged['photos_enabled'] = pipeline_config.get('photos_enabled', True)
         merged['incremental_mode'] = pipeline_config.get('incremental_mode', True)
         merged['daily_api_limit'] = api_config.get('daily_api_limit', 150)
         merged['daily_api_budget'] = api_config.get('daily_api_budget', 1.5)
@@ -109,7 +111,6 @@ class TrendrPipelineOrchestrator:
         logger.info(f"   Batch size: {self.merged_params['batch_size']}")
         logger.info(f"   Fields: {self.merged_params['fields']}")
         logger.info(f"   Dry run: {self.merged_params['dry_run']}")
-        logger.info(f"   Photos enabled: {self.merged_params['photos_enabled']}")
         logger.info(f"   Daily API budget: ${self.merged_params['daily_api_budget']}")
         logger.info(f"   Max requests/day: {self.merged_params['max_requests_per_day']}")
         if self.merged_params['dry_run']:
@@ -230,7 +231,9 @@ class TrendrPipelineOrchestrator:
             
             if result.returncode == 0:
                 logger.info(f"[{step_name}] ✅ Completed in {duration:.1f}s")
-                return True, result.stdout
+                # Return combined output (stdout + stderr) for parsing
+                combined_output = result.stdout + "\n" + result.stderr
+                return True, combined_output
             else:
                 logger.error(f"[{step_name}] ❌ Failed with exit code {result.returncode}")
                 logger.error(f"[{step_name}] Error output: {result.stderr}")
@@ -457,8 +460,12 @@ class TrendrPipelineOrchestrator:
                 # Look for common patterns
                 if 'ingested' in line.lower() and any(c.isdigit() for c in line):
                     numbers = [int(s) for s in line.split() if s.isdigit()]
-                    if numbers and step_name == 'INGEST':
+                    if numbers and step_name in ['INGEST', 'DISCOVERY-GRID']:
                         self.stats['ingested'] += numbers[0]
+                elif 'refreshed' in line.lower() and any(c.isdigit() for c in line):
+                    numbers = [int(s) for s in line.split() if s.isdigit()]
+                    if numbers and step_name == 'REFRESH-STALE':
+                        self.stats['ingested'] += numbers[0]  # Count refreshed POIs as ingested
                 elif 'classified' in line.lower() and any(c.isdigit() for c in line):
                     numbers = [int(s) for s in line.split() if s.isdigit()]
                     if numbers and step_name == 'CLASSIFY':
@@ -468,18 +475,34 @@ class TrendrPipelineOrchestrator:
                     if numbers:
                         if step_name == 'MENTIONS':
                             self.stats['mentions_processed'] += numbers[0]
-                        elif step_name == 'PHOTOS':
-                            self.stats['photos_processed'] += numbers[0]
+                elif 'spatial mapping:' in line.lower() and 'district' in line.lower():
+                    # Parse "Spatial mapping: X districts, Y neighbourhoods"
+                    numbers = [int(s) for s in line.split() if s.isdigit()]
+                    if len(numbers) >= 2:
+                        self.stats['mapped_districts'] += numbers[0]
+                        self.stats['mapped_neighbourhoods'] += numbers[1]
+                elif 'rating snapshot' in line.lower() and any(c.isdigit() for c in line):
+                    numbers = [int(s) for s in line.split() if s.isdigit()]
+                    if numbers:
+                        self.stats['rating_snapshots'] += numbers[0]
         except Exception:
             pass  # Ignore parsing errors
     
     def run_ingestion_step(self, city: str) -> bool:
-        """Run ingestion step"""
+        """Run H3-based ingestion step (single unified mode)"""
+        # Use config values for H3 ingestion - config-first approach
+        from config import get_config
+        config = get_config()
+        
+        update_interval_days = config.pipeline_config.update_interval_days
+        limit_cells = self.merged_params['batch_size']  # CLI can override batch size
+        
         cmd = [
             'python3', 'scripts/google_places_ingester.py',
-            '--seed',
+            '--h3-ingest',
             '--city-slug', city.lower(),
-            '--limit', str(self.merged_params['batch_size'])
+            '--limit-cells', str(limit_cells),
+            '--update-interval-days', str(update_interval_days)
         ]
         
         if logger.level == logging.DEBUG:
@@ -487,8 +510,15 @@ class TrendrPipelineOrchestrator:
         
         if self.merged_params['dry_run']:
             cmd.append('--dry-run')
+        
+        # Debug cell option
+        if self.merged_params.get('debug_cell'):
+            cmd.extend(['--debug-cell', self.merged_params['debug_cell']])
             
-        return self.run_subprocess(cmd, 'INGEST')
+        # Run H3-based ingestion (includes spatial mapping automatically)
+        success = self.run_subprocess(cmd, 'H3-INGEST')
+        
+        return success
     
     def run_mentions_step(self, city: str) -> bool:
         """Run mentions scanning step"""
@@ -531,21 +561,161 @@ class TrendrPipelineOrchestrator:
             
         return self.run_subprocess(cmd, 'CLASSIFY')
     
-    def run_photos_step(self, city: str) -> bool:
-        """Run photo processing step"""
-        if not self.merged_params['photos_enabled']:
-            logger.info("[PHOTOS] ⏭️  Photos disabled in config")
-            return True
-            
+    def run_discovery_grid_step(self, city: str) -> bool:
+        """Run systematic grid discovery of POIs"""
         cmd = [
-            'python3', 'scripts/photo_processor.py',
-            '--backfill',
-            '--city', city,
-            '--limit', str(self.merged_params['batch_size']),
-            '--rate-limit', '1.0'
+            'python3', 'scripts/google_places_ingester.py',
+            '--grid-scan',
+            '--area', 'all',  # Scan all arrondissements
+            '--grid-step-m', '350',
+            '--radius-m', '400',
+            '--types', 'restaurant,bar,cafe,bakery',
+            '--limit', str(self.merged_params['batch_size'])
         ]
+        
+        if logger.level == logging.DEBUG:
+            cmd.append('--debug')
+        
+        if self.merged_params['dry_run']:
+            cmd.append('--dry-run')
             
-        return self.run_subprocess(cmd, 'PHOTOS')
+        return self.run_subprocess(cmd, 'DISCOVERY-GRID')
+    
+    def run_refresh_stale_step(self, city: str) -> bool:
+        """Refresh stale POIs with updated data"""
+        cmd = [
+            'python3', 'scripts/google_places_ingester.py',
+            '--refresh-stale',
+            '--stale-days', '30',
+            '--limit', str(self.merged_params['batch_size'])
+        ]
+        
+        if logger.level == logging.DEBUG:
+            cmd.append('--debug')
+        
+        if self.merged_params['dry_run']:
+            cmd.append('--dry-run')
+            
+        return self.run_subprocess(cmd, 'REFRESH-STALE')
+    
+    def ingest_single_poi(self, city: str) -> tuple[bool, str]:
+        """Ingest a single POI and return success status and POI name"""
+        cmd = [
+            'python3', 'scripts/google_places_ingester.py',
+            '--seed',
+            '--city-slug', city.lower(),
+            '--limit', '1'
+        ]
+        
+        if logger.level == logging.DEBUG:
+            cmd.append('--debug')
+        
+        if self.merged_params['dry_run']:
+            cmd.append('--dry-run')
+        
+        success, output = self.run_subprocess_with_output(cmd, 'INGEST-SINGLE')
+        
+        if success:
+            # Parse output to get POI name from regular logs
+            poi_name = self._parse_poi_name_from_output(output)
+            
+            # Run spatial association if POI was ingested and not dry-run
+            if poi_name and poi_name != "Unknown POI" and not self.merged_params['dry_run']:
+                try:
+                    from utils.database import SupabaseManager
+                    db = SupabaseManager()
+                    result = db.client.rpc('update_all_paris_pois').execute()
+                    logger.debug(f"✅ Spatial association updated for {poi_name}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Spatial association failed for {poi_name}: {e}")
+            
+            return True, poi_name if poi_name else "Unknown POI"
+        
+        return False, ""
+    
+    def _parse_poi_name_from_output(self, output: str) -> Optional[str]:
+        """Extract POI name from ingester output logs"""
+        import re
+        # Look for pattern "poi_created: <name> | snapshot: written"
+        pattern = r"poi_created: ([^|]+) \|"
+        match = re.search(pattern, output)
+        if match:
+            poi_name = match.group(1).strip()
+            logger.debug(f"Extracted POI name from logs: {poi_name}")
+            return poi_name
+        
+        # Look for pattern "poi_updated: <name> | snapshot: skipped/written"
+        pattern = r"poi_updated: ([^|]+) \|"
+        match = re.search(pattern, output)
+        if match:
+            poi_name = match.group(1).strip()
+            logger.debug(f"Extracted POI name from logs: {poi_name}")
+            return poi_name
+            
+        logger.warning("Could not extract POI name from ingester output")
+        return "Unknown POI"
+    
+    def run_poi_mentions(self, poi_name: str, city: str) -> bool:
+        """Run mention scanning for a specific POI"""
+        mention_config = self.config.get('mention_scanner', {})
+        scan_mode = mention_config.get('mode', 'balanced')
+        if self.merged_params.get('serp_only'):
+            scan_mode = 'serp-only'
+            
+        cmd = ['python3', '-m', 'scripts.mention_scanner',
+               '--mode', scan_mode,
+               '--city-slug', city.lower(),
+               '--poi-name', poi_name]
+        
+        # Add sources for serp-only mode
+        if scan_mode == 'serp-only' and (self.config.get('social_proof_config') or {}).get('sources'):
+            cmd += ['--sources', ','.join(self.config['social_proof_config']['sources'])]
+            
+        # Debug options
+        debug_mode = (logger.level == logging.DEBUG) or self.merged_params.get('debug', False)
+        if debug_mode:
+            cmd += ['--debug']
+            
+        return self.run_subprocess(cmd, f'MENTIONS-{poi_name[:20]}')
+    
+    def run_full_pipeline_poi_by_poi(self, city: str) -> bool:
+        """Run full pipeline POI by POI (ingest → mentions → classify for each POI)"""
+        logger.info(f"🔄 Starting POI-by-POI pipeline for {city} (limit: {self.merged_params['batch_size']})")
+        
+        processed_pois = 0
+        for i in range(self.merged_params['batch_size']):
+            logger.info(f"📍 Processing POI {i+1}/{self.merged_params['batch_size']}")
+            
+            # Step 1: Ingest single POI
+            success, poi_name = self.ingest_single_poi(city)
+            if not success:
+                logger.warning(f"⚠️ Failed to ingest POI {i+1}, stopping pipeline")
+                break
+                
+            self.stats['ingested'] += 1
+            processed_pois += 1
+            logger.info(f"✅ Ingested: {poi_name}")
+            
+            # Step 2: Scan mentions for this POI
+            if not self.run_poi_mentions(poi_name, city):
+                logger.warning(f"⚠️ Mention scanning failed for {poi_name}")
+                # Continue with next POI even if mentions fail
+            else:
+                logger.info(f"✅ Mentions scanned for: {poi_name}")
+            
+            # Small delay between POIs to be respectful
+            import time
+            time.sleep(0.5)
+        
+        # Step 3: Run classification for all newly ingested POIs in this city
+        if processed_pois > 0:
+            logger.info(f"🤖 Running classification for {processed_pois} POIs in {city}")
+            if not self.run_classification_step(city):
+                logger.warning(f"⚠️ Classification failed for {city}")
+            
+        
+        logger.info(f"✅ POI-by-POI pipeline completed for {city}: {processed_pois} POIs processed")
+        return True
     
     def run_pipeline_mode(self) -> bool:
         """Execute pipeline according to selected mode"""
@@ -560,17 +730,8 @@ class TrendrPipelineOrchestrator:
             logger.info(f"🏙️  Processing city: {city}")
             
             if self.merged_params['mode'] in ['full', 'collections']:
-                # Full pipeline: all steps
-                if not self.run_ingestion_step(city):
-                    success = False
-                    break
-                if not self.run_mentions_step(city):
-                    success = False
-                    break  
-                if not self.run_classification_step(city):
-                    success = False
-                    break
-                if not self.run_photos_step(city):
+                # Full pipeline: POI-by-POI processing (ingest → mentions for each POI, then classify)
+                if not self.run_full_pipeline_poi_by_poi(city):
                     success = False
                     break
                     
@@ -589,8 +750,13 @@ class TrendrPipelineOrchestrator:
                     success = False
                     break
                     
-            elif self.merged_params['mode'] == 'photos':
-                if not self.run_photos_step(city):
+            elif self.merged_params['mode'] == 'discovery_grid':
+                if not self.run_discovery_grid_step(city):
+                    success = False
+                    break
+                    
+            elif self.merged_params['mode'] == 'refresh_stale':
+                if not self.run_refresh_stale_step(city):
                     success = False
                     break
         
@@ -601,14 +767,16 @@ class TrendrPipelineOrchestrator:
         duration = datetime.now() - self.start_time
         
         print("\n" + "="*60)
-        print("📊 TRENDR PIPELINE EXECUTION SUMMARY")
+        print("📊 GATTO PIPELINE EXECUTION SUMMARY")
         print("="*60)
         print(f"⏱️  Duration: {duration}")
         print(f"🏙️  Cities processed: {len(self.merged_params['cities'])}")
         print(f"📍 POIs ingested: {self.stats['ingested']}")
         print(f"🔍 Mentions processed: {self.stats['mentions_processed']}")
         print(f"🤖 POIs classified: {self.stats['classified']}")
-        print(f"📸 Photos processed: {self.stats['photos_processed']}")
+        print(f"🗺️  Districts mapped: {self.stats['mapped_districts']}")
+        print(f"🏘️  Neighbourhoods mapped: {self.stats['mapped_neighbourhoods']}")
+        print(f"⭐ Rating snapshots: {self.stats['rating_snapshots']}")
         print(f"❌ Errors: {len(self.stats['errors'])}")
         
         if self.stats['errors']:
@@ -623,7 +791,7 @@ class TrendrPipelineOrchestrator:
 def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(
-        description='Trendr Data Pipeline - Gatto Orchestrator',
+        description='Gatto Data Pipeline - AI-Powered POI Discovery',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -640,7 +808,7 @@ Seed Pipeline (SEED → SCAN):
     
     # Main arguments
     parser.add_argument('--city', help='City to process (if not provided, uses config.json cities)')
-    parser.add_argument('--mode', choices=['full', 'ingest', 'mentions', 'classify', 'photos', 'collections'],
+    parser.add_argument('--mode', choices=['full', 'ingest', 'mentions', 'classify', 'collections', 'discovery_grid', 'refresh_stale'],
                        default='full', help='Pipeline execution mode (collections=alias for full)')
     parser.add_argument('--limit', type=int, help='Batch size for each step (overrides config.json batch_size)')
     parser.add_argument('--dry-run', action='store_true', help='Log actions without network/DB calls')
@@ -658,6 +826,7 @@ Seed Pipeline (SEED → SCAN):
     
     # Debug arguments
     parser.add_argument('--debug', action='store_true', help='Enable debug mode with detailed logging and output files')
+    parser.add_argument('--debug-cell', type=str, help='Debug: scan only specific H3 cell (e.g., 891fb466257ffff)')
     
     # Seed POI arguments for chained SEED → SCAN pipeline
     seed_group = parser.add_mutually_exclusive_group()
@@ -674,7 +843,7 @@ Seed Pipeline (SEED → SCAN):
         parser.error("--seed-city is required when using --seed-poi-name")
     
     # Initialize orchestrator
-    orchestrator = TrendrPipelineOrchestrator()
+    orchestrator = GattoPipelineOrchestrator()
     
     try:
         # Load configuration
@@ -687,7 +856,7 @@ Seed Pipeline (SEED → SCAN):
         orchestrator.log_effective_params()
         
         # Execute pipeline
-        logger.info("🚀 STARTING TRENDR PIPELINE EXECUTION")
+        logger.info("🚀 STARTING GATTO PIPELINE EXECUTION")
         success = orchestrator.run_pipeline_mode()
         
         # Print summary

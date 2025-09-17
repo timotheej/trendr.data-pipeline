@@ -3,15 +3,9 @@
     "cities": ["Paris"],
     "poi_categories": [
       "restaurant",
-      "cafe",
       "bar",
-      "tourist_attraction",
-      "shopping_mall",
-      "store",
-      "entertainment",
-      "park",
-      "gym",
-      "spa"
+      "bakery",
+      "cafe"
     ],
     "daily_api_limit": 150,
     "batch_size": 25,
@@ -268,6 +262,13 @@
       "trendy": ["hip", "popular", "buzzing", "vibrant", "hotspot"],
       "hidden_gem": ["hidden", "gem", "secret", "local", "authentic"]
     }
+  },
+
+  "h3": {
+    "seed_res": 9,
+    "max_res": 11,
+    "scan_cap_per_cell": 60,
+    "subdivide_on_cap": true
   },
 
   "deployment_config": {

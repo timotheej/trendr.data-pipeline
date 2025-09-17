@@ -773,7 +773,6 @@ class GattoMentionScanner:
                     excerpt = candidate.get('snippet', '')
                     title = candidate.get('title', '')
                     query = candidate.get('query_used', '')  
-                    serp_position = None  # TODO: add position tracking in candidate creation
                     final_score = candidate.get('score', 0.0)
                     
                     # Get score components from audit data if available
@@ -795,7 +794,6 @@ class GattoMentionScanner:
                         title=title,
                         domain=domain,
                         query=query,
-                        serp_position=serp_position,
                         final_score=final_score,
                         score_components=score_components,
                         published_at=published_at,

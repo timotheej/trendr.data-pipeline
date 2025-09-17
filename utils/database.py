@@ -767,7 +767,6 @@ class SupabaseManager:
                 'title': title[:200] if title else None,  # Reasonable title limit
                 'domain': domain[:100] if domain else None,
                 'query': query[:300] if query else None,
-                'serp_position': serp_position if serp_position is not None else None,
                 'final_score': final_score if final_score is not None else None,
                 'score_components': score_components if score_components else None,
                 'accepted': True,  # Only accepted mentions are persisted
@@ -792,8 +791,7 @@ class SupabaseManager:
                             'last_seen_at': mention_data['last_seen_at'],
                             'title': mention_data['title'],
                             'domain': mention_data['domain'],
-                            'query': mention_data['query'],
-                            'serp_position': mention_data['serp_position']
+                            'query': mention_data['query']
                         })\
                         .eq('poi_id', mention_data['poi_id'])\
                         .eq('url', mention_data['url'])\
@@ -812,7 +810,7 @@ class SupabaseManager:
             raise
 
     def upsert_source_mention_new(self, poi_id: str, url: str, excerpt: str, title: str, domain: str, 
-                                 query: str, serp_position: int, final_score: float, score_components: dict,
+                                 query: str, final_score: float, score_components: dict,
                                  source_id: str = None, discovered_source_id: str = None,
                                  published_at: str = None, published_at_confidence: str = None, 
                                  published_at_method: str = None) -> bool:
@@ -822,7 +820,7 @@ class SupabaseManager:
         Args:
             poi_id: POI UUID
             url: Final URL of the mention
-            excerpt, title, domain, query, serp_position, final_score, score_components: Mention data
+            excerpt, title, domain, query, final_score, score_components: Mention data
             source_id: Source identifier from source_catalog (for cataloged sources)
             discovered_source_id: Discovered source ID (for non-cataloged sources)
             
@@ -840,7 +838,6 @@ class SupabaseManager:
                 'title': title[:200] if title else None,
                 'domain': domain[:100] if domain else None,
                 'query': query[:300] if query else None,
-                'serp_position': serp_position if serp_position is not None else None,
                 'final_score': final_score if final_score is not None else None,
                 'score_components': score_components if score_components else None,
                 'published_at': published_at,
@@ -876,8 +873,7 @@ class SupabaseManager:
                     'last_seen_at': mention_data['last_seen_at'],
                     'title': mention_data['title'],
                     'domain': mention_data['domain'],
-                    'query': mention_data['query'],
-                    'serp_position': mention_data['serp_position']
+                    'query': mention_data['query']
                 }
                 
                 if source_id:
